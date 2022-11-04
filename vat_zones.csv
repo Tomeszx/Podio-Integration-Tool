@@ -1,0 +1,14 @@
+,IT,ES,FR,FI,DE,DK,NL,BE,SE,PL,NO,CH,UK
+IT,eu,eu,eu,eu,eu,domestic,eu,eu,eu,eu,foreign,foreign,foreign
+ES,eu,eu,eu,eu,eu,domestic,eu,eu,eu,eu,foreign,foreign,foreign
+FR,eu,eu,eu,eu,eu,domestic,eu,eu,eu,eu,foreign,foreign,foreign
+FI,eu,eu,eu,eu,eu,domestic,eu,eu,eu,eu,foreign,foreign,foreign
+DE,eu,eu,eu,eu,eu,domestic,eu,eu,eu,eu,foreign,foreign,foreign
+DK,eu,eu,eu,eu,eu,domestic,eu,eu,eu,eu,foreign,foreign,foreign
+NL,eu,eu,eu,eu,eu,eu,domestic,eu,eu,eu,foreign,foreign,foreign
+BE,eu,eu,eu,eu,eu,eu,eu,domestic,eu,eu,foreign,foreign,foreign
+SE,eu,eu,eu,eu,eu,eu,eu,eu,domestic,eu,foreign,foreign,foreign
+PL,eu,eu,eu,eu,eu,eu,eu,eu,eu,domestic,foreign,foreign,foreign
+NO,foreign,foreign,foreign,foreign,foreign,foreign,foreign,foreign,foreign,foreign,domestic,foreign,foreign
+CH,foreign,foreign,foreign,foreign,foreign,foreign,foreign,foreign,foreign,foreign,foreign,domestic,foreign
+UK,eu,eu,eu,eu,eu,domestic,eu,eu,eu,eu,foreign,foreign,foreign
