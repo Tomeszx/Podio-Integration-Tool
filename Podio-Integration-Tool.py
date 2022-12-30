@@ -24,13 +24,12 @@ from selenium.webdriver.chrome.service import Service as ChromeService
 from oauth2client.service_account import ServiceAccountCredentials
 from test_podio_data import test_data
 
-# from subprocess import CREATE_NO_WINDOW
-
 select_fields_names = json.load(open("select_fields_names.json"))
 input_fields_names = json.load(open("input_fields_names.json"))
 tickbox_class_names = json.load(open("tickbox_class_names.json"))
 vat_zones = pd.read_csv('vat_zones.csv', index_col=0)
-login = json.load(open("config.json"))
+login_default = json.load(open("config.json"))
+login = {}
 
 
 def main(tasks_list: dict, comment_period: int, website) -> None:
@@ -156,8 +155,8 @@ class Podio:
         website.get("https://podio.com/tasks")
         WebDriverWait(website, 10).until(EC.presence_of_element_located((By.ID, "loginForm")))
 
-        website.find_element(By.XPATH, "//*[@id='email']").send_keys(login['Update Admins']['username'])
-        website.find_element(By.XPATH, "//*[@id='password']").send_keys(login['Update Admins']['password'])
+        website.find_element(By.XPATH, "//*[@id='email']").send_keys(login['username_podio'])
+        website.find_element(By.XPATH, "//*[@id='password']").send_keys(login['password_podio'])
         website.find_element(By.XPATH, "//*[@id='loginFormSignInButton']").click()
         WebDriverWait(website, 10).until(EC.presence_of_element_located((By.ID, "show-more-tasks")))
 
@@ -408,7 +407,7 @@ class Podio:
             msg = comment
 
         text_box.clear()
-        time.sleep(0.5)
+        time.sleep(1)
         text_box.send_keys(msg)
 
         button = WebDriverWait(website, 10).until(EC.element_to_be_clickable((By.XPATH, '//button[@label="Add"]')))
@@ -486,8 +485,8 @@ class Admin:
                 time.sleep(2)
 
         if website.find_elements(By.XPATH, '//*[@id="password"]'):
-            website.find_element(By.XPATH, '//*[@id="username"]').send_keys(login['Update Admins']['username'])
-            website.find_element(By.XPATH, '//*[@id="password"]').send_keys(login['Update Admins']['password'])
+            website.find_element(By.XPATH, '//*[@id="username"]').send_keys(login['username_admin'])
+            website.find_element(By.XPATH, '//*[@id="password"]').send_keys(login['password_admin'])
             website.find_element(By.XPATH, '/html/body/div[2]/div/div/form/fieldset/div[4]/div/input[2]').click()
             if market.lower() == 'cn':
                 xpath = '//button[@class="btn btn-mini login-user pull-right"]'
@@ -738,10 +737,11 @@ class Admin:
         new_comm = round(float(pure_comm) * ((self.vat_rate[dict_html['market']] / 100) + 1), 2)
 
         reducer_type_field = Select(website.find_element(By.XPATH, '//select[@name="commission_reducer_type"]'))
+        prev_reucer = reducer_type_field.first_selected_option.get_attribute("value")
         shop_name = website.find_element(By.XPATH, '//input[@name="shopname"]').get_attribute("value")
         partner_type = Select(
             website.find_element(By.XPATH, '//select[@name="admin"]')).first_selected_option.text.lower()
-        full_name = f'{shop_name} ({partner_type}) ({reducer_type_field.first_selected_option.get_attribute("value")})'
+        full_name = f'{shop_name} ({partner_type}) ({prev_reucer})'
 
         # Go to commission tool
         if len(website.window_handles) < 5:
@@ -853,14 +853,13 @@ class Admin:
         reducer_field = Select(website.find_element(By.XPATH, '//select[@name="commission_reducer_type"]'))
         if reducer_field.first_selected_option.get_attribute("value") != reducer_type:
             reducer_field.select_by_value(reducer_type)
-            reducer_type = f"was changed to [{reducer_type}]"
 
             response = self.save_edit_view(website, dict_html)
             if "issue" in response:
                 return "Issue", response
 
-        dict_html['commission_values'].append(f" >{dict_html['market']} ({self.vat_rate[dict_html['market']]}% VAT): "
-                                              f"[{old_com}%]-->[{new_comm}%] [{reducer_type}]\n")
+        dict_html['commission_values'].append(f" >{dict_html['market']} ({self.vat_rate[dict_html['market']]}%VAT): "
+                                              f"[{old_com}%] {prev_reucer}->[{new_comm}%] {reducer_type}\n")
 
         comment = f"Successfully finished updating commission in Admin.\n" \
                   f"What was updated?\n\n---\n" \
@@ -883,8 +882,8 @@ class ProductService:
             time.sleep(0.5)
 
         if website.find_elements(By.XPATH, '//*[@id="username"]'):
-            website.find_element(By.XPATH, '//*[@id="username"]').send_keys(login['Update Admins']['username PC'])
-            website.find_element(By.XPATH, '//*[@id="password"]').send_keys(login['Update Admins']['password PC'])
+            website.find_element(By.XPATH, '//*[@id="username"]').send_keys(login['username_pc'])
+            website.find_element(By.XPATH, '//*[@id="password"]').send_keys(login['password_pc'])
             website.find_element(By.XPATH, '//*[@type="submit"]').click()
             WebDriverWait(website, 10).until(EC.presence_of_element_located((By.XPATH, '//table')))
 
@@ -1057,25 +1056,37 @@ class GUI:
         progress_regex=r"^progress: (\d+)/(\d+)$",
         progress_expr="x[0] / x[1] * 100",
         disable_progress_bar_animation=False,
-        default_size=(810, 630),
+        default_size=(810, 720),
         timing_options={'show_time_remaining': True, 'hide_time_remaining_on_complete': False}
     )
     def handle(self):
         parser = GooeyParser()
+
+        user = login_default['Update Admins']
+        parser.add_argument("--username_podio", metavar='Username Podio', default=user['username_podio'])
+        parser.add_argument("--password_podio", metavar='Password Podio', widget='PasswordField',
+                            default=user['password_podio'])
+
+        parser.add_argument("--username_admin", metavar='Username Admin', default=user['username_admin'])
+        parser.add_argument("--password_admin", metavar='Password Admin', widget='PasswordField',
+                            default=user['password_admin'])
+
+        parser.add_argument("--username_pc", metavar='Username Product Service', default=user['username_pc'])
+        parser.add_argument("--password_pc", metavar='Password Product Service', widget='PasswordField',
+                            default=user['password_pc'])
 
         parser.add_argument("--threads_num", metavar="How many processes do you need at once?", widget="Slider",
                             default=4, gooey_options={'min': 1, 'max': 6}, type=int)
         parser.add_argument("--comment_period", metavar="After [X] days I should add the same comment?",
                             widget="Slider", default=3, gooey_options={'min': 1, 'max': 10}, type=int)
 
-        checkboxes = parser.add_argument_group('Main checkboxes', gooey_options={'columns': 1 - 2})
+        checkboxes = parser.add_argument_group('Tasks from Podio', gooey_options={'columns': 1 - 2})
         checkboxes.add_argument("--headless_website", metavar=" ", widget="BlockCheckbox",
-                                default=True, action='store_false',
-                                gooey_options={'checkbox_label': "headless website", 'show_label': True})
+                                default=True, action='store_false', gooey_options=
+                                {'checkbox_label': "headless website", 'show_label': True})
         checkboxes.add_argument("--All_tasks", metavar=" ", widget="BlockCheckbox",
-                                default=True, action='store_false',
-                                gooey_options={'checkbox_label': "All tasks except 'Add commission'",
-                                               'show_label': True})
+                                default=True, action='store_false', gooey_options=
+                                {'checkbox_label': "All tasks except 'Add commission'", 'show_label': True})
 
         # Dynamic tick boxes to choose tasks that need to be done
         tasks = json.load(open("Tasks.json"))
@@ -1108,8 +1119,10 @@ class GUI:
             tasks_dict = tasks
             tasks_dict.pop("Add commission", None)  # This task can't be run with headless option
 
+        login.update(user_inputs)
+
         self.setup_chromedriver_options(user_inputs)
-        self.threads(user_inputs['threads_num'], tasks_dict, user_inputs['comment_period'])
+        self.threads(user_inputs, tasks_dict)
 
     def setup_chromedriver_options(self, user_inputs):
         self.chromedriver_options = webdriver.ChromeOptions()
@@ -1127,7 +1140,10 @@ class GUI:
         if not user_inputs["headless_website"] and not user_inputs["Add_commission"]:
             self.chromedriver_options.add_argument("--headless")
 
-    def threads(self, threads_num, tasks_dict, comment_period):
+    def threads(self, user_inputs, tasks_dict):
+        threads_num = user_inputs['threads_num']
+        comment_period = user_inputs['comment_period']
+
         os.environ["WDM_LOG_LEVEL"] = "0"
         website = webdriver.Chrome(service=ChromeService(ChromeDriverManager().install()),
                                    options=self.chromedriver_options)
