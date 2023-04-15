@@ -1,4 +1,7 @@
 #!venv/bin/python3.9
+import contextlib
+import random
+import warnings
 import json
 import os
 import re
@@ -6,141 +9,179 @@ import threading
 import time
 import gspread
 import pycountry
+import requests
 
 import gspread_dataframe as gd
-import numpy as np
 import pandas as pd
 
 from datetime import datetime
+from multiprocessing import Pool
 from gooey import Gooey, GooeyParser
 from selenium import webdriver
-from selenium.common.exceptions import NoSuchElementException
+from bs4 import MarkupResemblesLocatorWarning
+from selenium.common.exceptions import NoSuchElementException, TimeoutException, StaleElementReferenceException
 from selenium.webdriver import ActionChains
 from selenium.webdriver.common.by import By
-from selenium.webdriver.support.ui import Select
-from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support.ui import Select, WebDriverWait
 from webdriver_manager.chrome import ChromeDriverManager
+from bs4 import BeautifulSoup as bs
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.chrome.service import Service as ChromeService
 from oauth2client.service_account import ServiceAccountCredentials
 from test_podio_data import test_data
 
-select_fields_names = json.load(open("select_fields_names.json"))
-input_fields_names = json.load(open("input_fields_names.json"))
-tickbox_class_names = json.load(open("tickbox_class_names.json"))
-vat_zones = pd.read_csv('vat_zones.csv', index_col=0)
-login_default = json.load(open("config.json"))
-login = {}
+login, api_calls_stats = {}, {}
+select_fields_names = json.load(open("Podio & PAMS fields/select_fields_names.json"))
+input_fields_names = json.load(open("Podio & PAMS fields/input_fields_names.json"))
+tickbox_class_names = json.load(open("Podio & PAMS fields/tickbox_class_names.json"))
+vat_zones = pd.read_csv('Vat Zones/vat_zones.csv', index_col=0)
+login_default = json.load(open("Credentials/config.json"))
+markets = {"NL": "Netherlands", "DK": "Denmark", "SE": "Sweden", "BE": "Belgium", "FR": "France",
+           "IT": "Italy", "ES": "Spain", "DE": "Germany", "PL": "Poland", "UK": "United Kingdom",
+           "FI": "Finland", "CN": "China", "NO": "Norway"}
 
 
-def main(tasks_list: dict, comment_period: int, website) -> None:
-    Podio().login(website)
-    task_window = website.current_window_handle
-
+def main(website, tasks_list: dict, comment_period: int, tasks_dict: dict, access_tokens: list) -> None:
     for task_row in tasks_list:
-        dict_html = {"task": task_row[0], "part_title": task_row[1], "tasks_keys": task_row[2],
-                     "link_to_task": task_row[3], "link_to_shop": task_row[4], "Partner_Name": task_row[5],
-                     "partner_type": task_row[4].split("/")[6], 'comment_period': comment_period}
+        data = {"tasks_keys": tasks_dict, 'comment_period': comment_period}
+        data |= task_row
 
-        if "vintage" in dict_html['partner_type']:
-            dict_html['partner_type'] = "partners"
+        if "vintage" in data['partner_type']:
+            data['partner_type'] = "partners"
 
-        print("\n>>>>", dict_html['Partner_Name'], ">>>>", dict_html['task'], "\n")
+        print(f"\n{'':^40}>>>>>>>> {data['Partner_Name']} {data['task_text']} <<<<<<<<<<")
 
-        comment, dict_html = Podio().prepare_data(website, task_window, dict_html)
-        if (comment is False or "Username" in comment) and "Create core" in dict_html['task']:
-            action, comment = Podio().add_username_password(website, dict_html)
+        podio = Podio(data, access_tokens)
+        comment, data = podio.prepare_data()
+        podio.data = data
+
+        if (podio.limit - podio.remaining) / podio.limit >= 0.80:
+            try:
+                podio.access_tokens.pop(0)
+            except IndexError:
+                print("You have almost exceed the API rate limit. Try again for one hour.")
+                return
+
+        if (comment is False or "Username" in comment) and "Create core" in data['part_title']:
+            action, comment = podio.add_username_password()
+            if not podio.data['files']:
+                action, comment = "Issue", "Can`t create admins because PDF contract is not attched to the Podio."
             if "Issue" in action:
-                Podio().add_error_comment(website, comment, dict_html)
+                print(podio.add_error_comment(comment))
                 continue
         elif comment is not False and "go to next task" in comment:
             continue
         elif comment is not False:
-            Podio().add_error_comment(website, comment, dict_html)
+            print(podio.add_error_comment(comment))
             continue
 
-        website.execute_script("window.open()")
-        website.switch_to.window(website.window_handles[3])
-
         # Choosing task
-        if 'pc location' in dict_html['task'].lower():
-            ProductService().create_pc_location(website, dict_html)
-            action, comment = ProductService().add_aliases(website, dict_html)
+        if 'pc location' in data['part_title'].lower():
+            ProductService().create_pc_location(website, data)
+            action, comment = ProductService().add_aliases(website, data)
 
-        elif 'add aliases' in dict_html['task'].lower():
-            action, comment = ProductService().add_aliases(website, dict_html)
+        elif 'add aliases' in data['part_title'].lower():
+            action, comment = ProductService().add_aliases(website, data)
 
         # Update Admins
         else:
-            action, comment = admin_tasks(website, dict_html)
+            action, comment = admin_tasks(website, podio, data)
 
         # Update Podio with comment and click tickbox if needed
         if "Issue" in action or "error" in comment:
-            print(Podio().add_error_comment(website, comment, dict_html))
+            print(podio.add_error_comment(comment))
             if action == "Issue, but click tickbox":
-                Podio().complete_task(website)
+                podio.complete_task(website)
         elif action == "Success":
-            Podio().complete_task(website)
-            Podio().add_comment(website, comment, dict_html)
+            podio.complete_task()
+            print(podio.add_comment(comment))
         else:
             raise ValueError("Undefined action happened.")
 
 
-def admin_tasks(website, dict_html: dict) -> (str, str):
+def admin_tasks(website, podio, data: dict) -> (str, str):
     # Check and exclude markets that need to be added
-    if "other markets" in dict_html['task'].lower() or "create core" in dict_html['task'].lower():
+    if data['part_title'] in ["Check id's in PAMS", "Other markets", "Create core"]:
         all_shop_ids = ""
-        for i in dict_html['Markets_to_activate_for_the_partner']:
-            if i + "-" not in dict_html['All_Shop_IDs']:
+        for i in data['Markets_to_activate_for_the_partner']:
+            if i + "-" not in data['All_Shop_IDs']:
                 i = i.replace("SHWRM", "PL")
-                all_shop_ids += f',{i}-0' if len(all_shop_ids) > 0 else f'{i}-0'
+                all_shop_ids += f',{i}-create' if len(all_shop_ids) > 0 else f'{i}-create'
 
-        if all_shop_ids.count("-0") == 0:
+        if all_shop_ids.count("-create") == 0:
             return "Issue, but click tickbox", "There are no new markets to add for this Partner."
-
+        elif "create core" in data['part_title'].lower():
+            all_shop_ids = ",".join(podio.sort_core_as_first(all_shop_ids.split(",")))
+        elif "other market" in data['part_title'].lower():
+            all_shop_ids = all_shop_ids.replace("create", "add_market")
     else:
-        all_shop_ids = dict_html['All_Shop_IDs']
+        all_shop_ids = data['All_Shop_IDs']
 
+    data['all_used_ids'] = all_shop_ids
     # Update information in all markets one by one
     for shop_id in all_shop_ids.split(","):
-        dict_html['market'] = shop_id.split("-")[0]
-        dict_html['id'] = shop_id.split("-")[1]
+        data['market'] = shop_id.split("-")[0]
+        data['id'] = shop_id.split("-")[1]
 
-        if 'Additional shipping locations' in dict_html['task'] or 'Return address' in dict_html['task']:
-            if dict_html['market'] == "CN":
+        if "Check id's in PAMS" in data['part_title']:
+            PAMS().open(website, data["pams_partner_id"])
+            data['pams_id'] = data["pams_partner_id"]
+            new_ids, action, comment = PAMS().wait_for_ids(website, data)
+            podio.add_new_shop_ids(new_ids, data['pams_id'])
+            action = "Success"
+            if "Issue" in comment:
+                action = "Issue"
+            break
+
+        elif 'Additional shipping locations' in data['part_title']:
+            action, comment = PAMS().update_extra_shipp_address(website, data)
+
+        elif 'Return address' in data['part_title']:
+            data |= data["shipping_locations"]["Return 0"]
+            action, comment = PAMS().update_edit_view(website, data)
+
+        elif "commission" in data['part_title'].lower().replace(" ", ""):
+            if data['market'] == "CN":
                 continue
+            if data.get('commission_values') is None:
+                data['commission_values'] = []
+            action, comment = Admin().update_commission(website, data)
 
-            action, comment = Admin().update_extra_shipp_address(website, dict_html)
+        elif "IBAN" in data['part_title'] or "Other markets" in data['part_title'] \
+                or "create core" in data['part_title'].lower() or "all fields" in data['part_title']:
 
-        elif "commission" in dict_html['task'].lower().replace(" ", ""):
-            if dict_html['market'] == "CN":
-                continue
-            if dict_html.get('commission_values') is None:
-                dict_html['commission_values'] = []
-            action, comment = Admin().update_commission(website, dict_html)
-
-        elif "IBAN" in dict_html['task'] or "other markets" in dict_html['task'].lower() \
-                or "create core" in dict_html['task'].lower() or "all fields" in dict_html['task']:
-
-            dict_html['payment_method'], m = "IBAN/Swift", dict_html['market']
-            if "Multiple IBANs" in dict_html:
-                if dict_html.get(f"IBAN {m}") and dict_html.get(f"SWIFT {m}"):
-                    dict_html['Bank_Account_Number_-_IBAN_(format:_PL123456789)'] = dict_html[f"IBAN {m}"]
-                    dict_html['Bank_Account_Number_-_SWIFT'] = dict_html[f"SWIFT {m}"]
-                elif dict_html.get(f"Account {m}") and dict_html.get(f"CODE {m}"):
-                    dict_html['Bank_Account_Number_-_IBAN_(format:_PL123456789)'] = dict_html[f"Account {m}"]
-                    dict_html['Bank_Account_Number_-_SWIFT'] = dict_html[f"CODE {m}"]
-                    dict_html['payment_method'] = "Bank transfer"
+            data['payment_method'], m = "IBAN/SWIFT", data['market']
+            if "Multiple IBANs" in data:
+                if data.get(f"IBAN {m}") and data.get(f"SWIFT {m}"):
+                    data['Bank_Account_Number_-_IBAN_(format:_PL123456789)'] = data[f"IBAN {m}"]
+                    data['Bank_Account_Number_-_SWIFT'] = data[f"SWIFT {m}"]
+                elif data.get(f"Account {m}") and data.get(f"CODE {m}"):
+                    data['Bank_Account_Number_-_IBAN_(format:_PL123456789)'] = data[f"Account {m}"]
+                    data['Bank_Account_Number_-_SWIFT'] = data[f"CODE {m}"]
+                    data['payment_method'] = "Bank transfer"
                 else:
                     comment = f"The wrong format, probably missing market in IBAN/SWIFT. " \
-                              f"\nCheck if [{dict_html['market']}] is included in the field."
+                              f"\nCheck if [{data['market']}] is included in the field."
                     return "Issue", comment
 
-            action, comment = Admin().update_edit_view_admin(website, dict_html)
-            if "Create core" in dict_html['task'] and shop_id == all_shop_ids.split(",")[-1]:
-                Podio().sort_shop_ids(website, dict_html)
+            action, comment = PAMS().update_edit_view(website, data)
+
+            if "Issue" in action:
+                if "Create core" in data['part_title']:
+                    podio.add_new_shop_ids([], data['pams_id'])
+                return "Issue", comment
+            elif "Create core" in data['part_title'] and shop_id == all_shop_ids.split(",")[-1]:
+                new_ids, action, err_comment = PAMS().wait_for_ids(website, data)
+                podio.add_new_shop_ids(new_ids, data['pams_id'])
+                if err_comment:
+                    return "Issue", err_comment
+            elif "other market" in data['part_title'].lower() and shop_id == all_shop_ids.split(",")[-1]:
+                new_ids, action, err_comment = PAMS().wait_for_ids(website, data)
+                podio.add_new_shop_ids(new_ids, data['pams_id'])
+                if err_comment:
+                    return "Issue", err_comment
         else:
-            action, comment = Admin().update_edit_view_admin(website, dict_html)
+            action, comment = PAMS().update_edit_view(website, data)
 
         if "Issue" in action or "error" in comment:
             return action, comment
@@ -149,330 +190,234 @@ def admin_tasks(website, dict_html: dict) -> (str, str):
 
 
 class Podio:
-    def login(self, website) -> None:
-        website.get("https://podio.com/tasks")
-        WebDriverWait(website, 10).until(EC.presence_of_element_located((By.ID, "loginForm")))
+    def __init__(self, data: dict, access_tokens: list):
+        self.access_tokens = access_tokens
+        self.data = data
 
-        website.find_element(By.XPATH, "//*[@id='email']").send_keys(login['username_podio'])
-        website.find_element(By.XPATH, "//*[@id='password']").send_keys(login['password_podio'])
-        website.find_element(By.XPATH, "//*[@id='loginFormSignInButton']").click()
-        WebDriverWait(website, 10).until(EC.presence_of_element_located((By.ID, "show-more-tasks")))
+    def __get_access_token__(self, client_id: str, client_secret: str) -> str:
+        # Set the client ID, client secret, username, and password
+        data = {
+            'grant_type': 'password',
+            'client_id': client_id,
+            'client_secret': client_secret,
+            'username': login['username_podio'],
+            'password': login['password_podio']
+        }
 
-    def get_tasks(self, website, tasks_keys: dict) -> list:
-        self.login(website)
-        start_time = time.time()
+        # Make the HTTP request to obtain the access token
+        response = requests.post('https://podio.com/oauth/token', data=data)
 
-        # Scroll down to get all tasks
-        show_more_tasks = website.find_elements(By.XPATH, '//*[@id="show-more-tasks"]')
-        while show_more_tasks:
-            website.execute_script("window.scrollTo(0, document.body.scrollHeight);")
-            website.execute_script("arguments[0].click();", show_more_tasks[0])
-            loaded_elements = len(website.find_elements(By.CLASS_NAME, 'task-wrapper '))
-            print(f"Collecting data... {loaded_elements} elements were loaded.")
-            time.sleep(1)
-            if website.find_elements(By.XPATH, '//*[@id="js-task-list"]/p[1]') or loaded_elements > 1200:
-                break
+        # Parse the response from the Podio API
+        data = response.json()
 
-        podio_rows = website.find_elements(By.XPATH, '//*[@class="single-task js-rank-task ui-sortable-handle"]')
-        tasks = website.find_elements(By.XPATH, '//*[@class="task-link edit-task-title"]')
-        shop_names = website.find_elements(By.XPATH, '//*[@class="linked-item"]')
+        if response.status_code != 200:
+            raise ConnectionRefusedError(data["error_description"])
 
-        # Send all tasks to Sheets (information only)
-        all_tasks_podio = [[s.text, t.text, s.get_attribute("href"), t.get_attribute("href")]
-                           for t, s in zip(tasks, shop_names)]
-        GoogleSheet().send_data(col=1, sheet_name="Tasks", data=all_tasks_podio)
+        limit = int(response.headers.get('X-Rate-Limit-Limit'))
+        remaining = int(response.headers.get('X-Rate-Limit-Remaining'))
+        api_calls_stats[f"Max api calls [{limit}]"] = f"You've made [{limit-remaining}] Api calls"
 
-        all_titles_text = [i.text for i in podio_rows]
-        collected_titles, current_task, tasks_list = [], 0, []
+        # return the access token from the response
+        return data['access_token']
 
-        xpath = './/a[@class="icon-16 icon-16-trash-small js-delete-task tooltip"]'
-        for row_elem, task_elem, shop_name_elem in zip(podio_rows, tasks, shop_names):
-            delete_task = row_elem.find_element(By.XPATH, xpath)
-            title = row_elem.text
+    def __send_request__(self, method: str, sec_part_url: str, data=None, params=None) -> dict:
+        response = requests.request(
+            method,
+            f"https://api.podio.com/{sec_part_url}",
+            headers={'Authorization': f'Bearer {self.access_tokens[0]}'},
+            json=data,
+            params=params,
+        )
+        self.limit = int(response.headers.get('X-Rate-Limit-Limit'))
+        self.remaining = int(response.headers.get('X-Rate-Limit-Remaining'))
+        api_calls_stats[f"Max api calls [{self.limit}]"] = f"You've made [{self.limit-self.remaining}] Api calls"
+        return response.json() if response.status_code == 200 else {}
 
-            # Remove duplicated tasks
-            task = task_elem.text
-            if all_titles_text.count(title) - collected_titles.count(title) > 1:
-                website.execute_script("arguments[0].click();", delete_task)
-                website.find_element(By.XPATH, '//button[@class="button-new primary confirm-button"]').click()
-                print(f"\n\nDeleting task: \n[{delete_task.find_element(By.XPATH, '../../../.').text}] \n[{title}]")
-                collected_titles.append(title)
+    def __delete_task__(self, task_id: str) -> dict:
+        return self.__send_request__(method='delete', sec_part_url=f'task/{task_id}')
+
+    def __update_field__(self, field_id: str, value: str, item_id=None) -> dict:
+        item_id = self.data['shop_item_id'] if item_id is None else item_id
+
+        return self.__send_request__('put', f'item/{item_id}/value/{field_id}', data={"value": value})
+
+    def __search_for_user__(self, user_name: str) -> str:
+        response = self.__send_request__('get', 'search/v2', params={'query': user_name, 'ref_type': 'profile',
+                                                                    'limit': 2})
+        return ([f"{result['link'].split('/')[-1]}"
+                 for result in response['results'] if user_name == result['title']][0] if response else "")
+
+    def __process_list_of_tasks__(self, tasks_list: list[dict], tasks_keys: dict) -> list:
+        tasks = {}
+        for task in tasks_list:
+            full_title = f'{task["Partner_Name"]} {task["task_text"]}'
+            if "Add commission" not in tasks_keys and "Add commission" in task["task_text"]:
                 continue
+            elif full_title in tasks:
+                self.__delete_task__(task['task_id'])
+            else:
+                tasks[full_title] = task
 
-            # searching for specific tasks
-            task_founded = False
-            for part_title in tasks_keys:
-                if part_title.lower().replace(" ", "") not in task.lower().replace(" ", ""):
-                    continue
-                if part_title == "commission" and "add " in task.lower():
-                    continue
-                task_founded = True
-                break
+        print(f"{'':^60}", " Tasks for the BOT ->", len(list(tasks.values())), f"{'':_^100}\n\n")
 
-            if task_founded:
-                link_to_task = task_elem.get_attribute("href")
-                link_to_shop = shop_name_elem.get_attribute("href")
+        return list(tasks.values())
 
-                tasks_list.append([task, part_title, tasks_keys, link_to_task, link_to_shop, shop_name_elem.text])
+    def get_tasks(self, tasks_keys: dict, responsible_id: str = '6461478') -> list[dict]:
+        tasks_list = []
+        number_tasks = 0
+        tasks_summary = self.__send_request__('GET', 'task/total/')['own']
+        with Pool() as pool:
+            results = []
 
-        print(f"\n\nJust finished collecting data. time spent on this:",
-              f"{round((time.time() - start_time) / 60, 2)} min.",
-              f"\n There are: {len(tasks_list)} tasks in Podio\n")
+            for offset in range(0, tasks_summary['later'], 100):
+                params = {'responsible': responsible_id, 'completed': False, 'offset': offset, 'limit': 100}
+                results.append(pool.apply_async(self.__send_request__, ('GET', 'task/', None, params)))
 
-        return tasks_list
+            for result in results:
+                response = result.get()
+                number_tasks += len(response)
+                tasks_list.extend(
+                    {
+                        'task_id': task['task_id'],
+                        'task_text': task['text'],
+                        'shop_item_id': task['ref']['data']['item_id'],
+                        'Partner_Name': task['ref']['data']['title'],
+                        'part_title': task_to_do,
+                        'partner_type': task['ref']['data']['app']['config']['name'].lower(),
+                        'link_to_shop': task['ref']['data']['link'],
+                        'task_requester': task['description']
+                    }
+                    for task in response if response
+                    for task_to_do in tasks_keys if task_to_do in task['text']
+                    if "PAMS TEST " in task['ref']['data']['title']  # Usun
+                )
+        print(f'{"":_^100}\n\n', f"{'':^60}", f"Number of tasks in Podio -> {number_tasks}")
+        print(f"{'':^60}", f" Tasks done yesterday -> {tasks_summary['completed_yesterday']}\n")
 
-    def get_fields_dict(self, website, task_dict: dict):
-        podio_data = {}
-        all_names = website.find_elements(By.TAG_NAME, 'li')
-        for i in all_names:
-            key = i.find_elements(By.XPATH, ".//div[@class='label-content']")
-            if key and key[0].text.replace("* ", "").replace(" ", "_") in task_dict:
-                child_text_input = i.find_elements(By.XPATH, './/p')
-                child_email_input = i.find_elements(By.XPATH, './/div[contains(text(), "@")]')
-                child_type_box = i.find_elements(By.XPATH, './/li')
-                child_select_box = i.find_elements(By.XPATH, './/select')
-                child_calc_box = i.find_elements(By.XPATH, './/div[@class="help-text-trigger"]')
-                child_number_input = i.find_elements(By.XPATH, './/div[@class="number-wrapper"]')
-                child_date_input = i.find_elements(By.XPATH, './/div[@class="field-date-display"]')
-                child_phone_input = i.find_elements(By.XPATH, './/div[@class="phone-field-component__view-mode__cell"]')
+        return self.__process_list_of_tasks__(tasks_list, tasks_keys)
 
-                key = key[0].text.replace("* ", "").replace(" ", "_")
+    def get_partner_details(self, item_id=None) -> dict[str, any]:
+        item_id = self.data['shop_item_id'] if item_id is None else item_id
 
-                if child_text_input:
-                    podio_data[key] = " ".join(i.text for i in child_text_input)
-                elif child_email_input:
-                    podio_data[key] = [i.text for i in child_email_input][:5]
-                elif child_type_box:
-                    podio_data[key] = [i.text for i in child_type_box if "selected" in i.get_attribute('class')]
-                elif child_select_box:
-                    podio_data[key] = Select(child_select_box[0]).first_selected_option.text
-                elif child_calc_box:
-                    podio_data[key] = child_calc_box[0].text
-                elif child_number_input:
-                    podio_data[key] = child_number_input[0].text
-                elif child_phone_input:
-                    index = len(child_phone_input) // 3
-                    podio_data[key] = child_phone_input[index].text
-                elif child_date_input and child_date_input[0].text != "":
-                    podio_data[key] = datetime.strptime(' '.join(child_date_input[0].text.split('\n')[1:3]), "%d %B %Y")
+        response = self.__send_request__(method='get', sec_part_url=f'item/{item_id}')
+        data = {'fields': {}, "fields_ids": {}, 'comments': []}
 
-        return podio_data
+        warnings.simplefilter("ignore", MarkupResemblesLocatorWarning)
+        for field in response['fields']:
+            key = field['label'].strip().replace(" ", "_")
+            if key not in self.data['tasks_keys'][self.data['part_title']]:
+                continue
+            data["fields_ids"][key] = field['field_id']
+            if field['type'] == 'contact':
+                data[key] = [value['value'] for value in field['values']]
+            elif field['type'] == 'date':
+                data[key] = [datetime.strptime(value['start_date'], "%Y-%m-%d") for value in field['values']]
+            elif field['type'] == 'category' and field['config']['settings']['multiple'] is True:
+                data[key] = [value['value']['text'] for value in field['values']]
+            elif field['type'] == 'category':
+                data[key] = [value['value']['text'] for value in field['values']][0]
+            elif field['type'] == 'email':
+                data[key] = [value['value'] for value in field['values'][:5]]
+            elif field['type'] in ['text', 'number', 'phone', 'calculation']:
+                data[key] = [value['value'] for value in field['values']][0]
+                data[key] = bs(data[key], 'html.parser').get_text().replace("\xa0", " ")
 
-    def prepare_data(self, website, task_window, dict_html: dict) -> (str, dict):
-        task_dict = dict_html['tasks_keys'][dict_html['part_title']]
+        for comment in response['comments']:
+            if comment['created_by']["name"] == "Update Admins":
+                data['comments'].append({'date': comment['created_on'], 'value': comment['value']})
 
-        # Close all unnessesary windows
-        while len(website.window_handles) > 1:
-            window_handle = website.window_handles[len(website.window_handles) - 1]
-            website.switch_to.window(window_handle)
-            if window_handle != task_window:
-                try:
-                    website.execute_script("window.close()")
-                except Exception:
-                    continue
-        website.switch_to.window(task_window)
+        for files in response['files']:
+            data['files'] = ".pdf" in files["name"]
 
-        website.execute_script("window.open()")
-        website.switch_to.window(website.window_handles[1])
-        website.get(dict_html['link_to_task'])
-        WebDriverWait(website, 10).until(EC.visibility_of_element_located((By.ID, "task-permalink")))
+        return data
 
-        task_requester = website.find_elements(By.XPATH, '//*[@id="task-permalink"]/div/div[2]/div[3]/div[2]/p')
-        if task_requester and "details" not in task_requester[0].text:
-            dict_html['task_requester'] = task_requester[0].text
-        else:
-            dict_html['task_requester'] = False
-
-        website.execute_script("window.open()")
-        website.switch_to.window(website.window_handles[2])
-        website.get(dict_html['link_to_shop'])
-
-        # Wait for the information on the page
-        WebDriverWait(website, 10).until(EC.visibility_of_element_located((By.CLASS_NAME, "frame-label")))
-        if website.find_elements(By.XPATH, "/html/body/center[1]/h1"):
-            website.refresh()
-            WebDriverWait(website, 10).until(EC.visibility_of_element_located((By.CLASS_NAME, "frame-label")))
-
-        # if we haven't got all_shop_ids then go to next task
-        if "-" not in website.find_element(By.XPATH, '//*[@id="all-shop-ids"]/div[1]/div[2]/div').text and \
-                'core' not in dict_html['task'].lower():
-            return "Issue go to next task", dict_html
+    def prepare_data(self) -> (str, dict):
+        task_dict = self.data['tasks_keys'][self.data['part_title']]
 
         # Get dict with all needed information from Podio
-        podio_data = self.get_fields_dict(website, task_dict)
+        podio_data = self.get_partner_details()
 
         # Test the data (that all elements in the dict are in the correct format)
-        comment, new_id, error = test_data(podio_data, task_dict, dict_html)
-        print(comment) if comment else print("The data looks good!")
+        comment, new_id, error = test_data(podio_data, task_dict, self.data)
+        print("There is an issue") if comment else print("The data looks good!")
 
         # If there is an issue with formatting then send comment to Podio and go to next task
         if "wrong format" in error:
             if "There are no new shops to create." in comment:
-                self.complete_task(website)
-            return comment, dict_html | podio_data
-        return comment, dict_html | podio_data
+                self.complete_task(self.data['task_id'])
+            return comment, self.data | podio_data
+        return comment, self.data | podio_data
 
-    def add_username_password(self, website, dict_html: dict) -> (str, str):
-        files = website.find_elements(By.XPATH, '//h5[@class="file-field-item-component__title"]')
-        pdf_contract = [True for i in files if ".pdf" in i.find_element(By.XPATH, './/a').get_attribute("title")]
-        if not pdf_contract:
-            return "Issue", "error: Can`t create admins because PDF contract is not attched to the Podio."
+    def add_username_password(self) -> (str, str):
+        fields_ids = ['222617769', '193610265'] \
+            if self.data['partner_type'] == "brands"\
+            else ["188759350", "188759351"]
 
-        fields = [["username-2" if "brands" in dict_html['partner_type'] else "username", dict_html['Username']],
-                  ['password', dict_html['Password']]]
-
-        for field in fields:
-            line = website.find_element(By.XPATH, f'//*[@id="{field[0]}"]/div[1]/div[2]/div')
-
-            line.click()
-
-            input_f = website.find_element(By.XPATH, f'//*[@id="{field[0]}"]/div[1]/div[2]/div/input')
-            input_f.clear()
-            input_f.send_keys(field[1])
-
-            website.find_element(By.XPATH, f'//*[@id="{field[0]}"]/div[1]/div[1]/div/div[2]').click()
+        self.__update_field__(fields_ids[0], self.data['Username'])
+        self.__update_field__(fields_ids[1], self.data['Password'])
 
         return "", ""
 
-    def add_new_shop_id(self, website, new_id: str) -> None:
-        website.switch_to.window(website.window_handles[2])
+    def add_new_shop_ids(self, new_ids: list, pams_id: str) -> None:
+        fields_ids = ["251071111", "193610233"] \
+            if self.data['partner_type'] == "brands" \
+            else ["249863352", "187361639"]
+        
+        print(self.__update_field__(fields_ids[0], pams_id))
 
-        all_id_field = website.find_element(By.XPATH, '//*[@id="all-shop-ids"]/div[1]/div[2]/div')
-        ids_before = all_id_field.text if "Add" not in all_id_field.text else ""
-        shop_ids = f"{ids_before},{new_id}" if ("Add" not in all_id_field.text or all_id_field.text == "") else new_id
-        all_id_field.click()
+        if new_ids:
+            podio_data = self.get_partner_details()
+            new_id_field = podio_data['All_Shop_IDs'].split(",") if podio_data.get("All_Shop_IDs") else []
+            new_id_field.extend(new_ids)
+            if self.data['part_title'] == "Create core" or \
+                    (self.data['part_title'] == "Check id's in PAMS" and not podio_data.get("All_Shop_IDs")):
+                new_id_field = self.sort_core_as_first(new_id_field)
+            new_list = ','.join([x for i, x in enumerate(new_id_field) if x not in new_id_field[:i]])
 
-        all_id_input = website.find_element(By.XPATH, '//*[@id="all-shop-ids"]/div[1]/div[2]/div/input')
-        all_id_input.clear()
-        all_id_input.send_keys(shop_ids)
+            self.__update_field__(fields_ids[1], new_list)
 
-        website.find_element(By.XPATH, '//*[@id="all-shop-ids"]/div[1]/div[1]/div/div[2]').click()
-        time.sleep(0.5)
+    def sort_core_as_first(self, all_shop_ids: list[str], home_market=None) -> list[str]:
+        home_market = self.data['Home_Market'] if home_market is None else home_market
+        markets_prefix = [i.split("-")[0] for i in all_shop_ids]
 
-    def sort_shop_ids(self, website, dict_html: dict) -> str:
-        website.switch_to.window(website.window_handles[2])
-
-        all_id_field = website.find_element(By.XPATH, '//*[@id="all-shop-ids"]/div[1]/div[2]/div')
-        markets = [i.split("-")[0] for i in all_id_field.text.split(",")]
-        ids = all_id_field.text.split(",")
-        all_id_field.click()
-
-        all_id_input = website.find_element(By.XPATH, '//*[@id="all-shop-ids"]/div[1]/div[2]/div/input')
-        all_id_input.clear()
-
-        home_market = dict_html['Home_Market']
-        if home_market.upper() in {'DK', 'SE', 'NL', 'BE', 'PL', 'CH', 'NO'} and home_market.upper() in markets:
-            ids.insert(0, ids.pop(ids.index(*[x for x in ids if re.search(home_market, x)])))
-        elif "NL" in markets:
-            ids.insert(0, ids.pop(ids.index(*[x for x in ids if re.search('NL', x)])))
+        if home_market.upper() in {'DK', 'SE', 'NL', 'BE', 'PL', 'CH', 'NO'} and home_market.upper() in markets_prefix:
+            all_shop_ids.insert(0, all_shop_ids.pop(
+                all_shop_ids.index(*[x for x in all_shop_ids if re.search(home_market, x)])))
+        elif "NL" in markets_prefix:
+            all_shop_ids.insert(0,
+                                all_shop_ids.pop(all_shop_ids.index(*[x for x in all_shop_ids if re.search('NL', x)])))
         else:
-            core_priority = [i for i in ["DK", "BE", "NO", "SE"] if i in markets]
-            ids.insert(0, ids.pop(ids.index(*[x for x in ids if re.search(core_priority[0], x)])))
+            core_priority = [i for i in ["DK", "BE", "NO", "SE"] if i in markets_prefix]
+            all_shop_ids.insert(0, all_shop_ids.pop(
+                all_shop_ids.index(*[x for x in all_shop_ids if re.search(core_priority[0], x)])))
 
-        all_id_input.send_keys(f"{','.join(ids)}")
+        return all_shop_ids
 
-        website.find_element(By.XPATH, '//*[@id="all-shop-ids"]/div[1]/div[1]/div/div[2]').click()
-        time.sleep(0.5)
+    def complete_task(self, task_id=None, complete_action: bool = True) -> dict:
+        task_id = self.data['task_id'] if task_id is None else task_id
 
-        return all_id_field.text
+        return self.__send_request__(method='put', sec_part_url=f'task/{task_id}', data={"completed": complete_action})
 
-    def complete_task(self, website) -> bool:
-        # click on the tasks tick box
-        website.switch_to.window(website.window_handles[1])
-        website.refresh()
+    def add_comment(self, value: str, item_id=None) -> str:
+        item_id = self.data['shop_item_id'] if item_id is None else item_id
+        user_id = self.__search_for_user__(self.data['task_requester'])
+        msg = f"@[{self.data['task_requester']}](user:{user_id})\n\n{value}" if user_id else value
 
-        xpath = '//*[@id="task-permalink"]/div/div[1]/div[1]/div[1]/span/span/img'
-        box = WebDriverWait(website, 10).until(EC.element_to_be_clickable((By.XPATH, xpath)))
-        box.click()
-
-        box_status = website.find_element(By.XPATH, '//*[@id="task-permalink"]/div/div[1]/div[1]/div[1]/span')
-
-        return "checked" in box_status.get_attribute("class")
-
-    def add_comment(self, website, comment: str, dict_html: dict) -> str:
-        website.switch_to.window(website.window_handles[2])
-
-        website.refresh()
-        loops = 0
-        while not website.find_elements(By.XPATH, '//textarea'):
-            loops += 1
-            time.sleep(0.5)
-            website.execute_script("window.scrollTo(0, document.body.scrollHeight);")
-            if loops == 11:
-                raise TimeoutError("Can't find textarea")
-
-        text_box = website.find_element(By.XPATH, '//textarea[@placeholder="Add a comment"]')
-        text_box.click()
-        try:
-            if dict_html['task_requester'] is False or "Update Admins" in dict_html['task_requester']:
-                raise ValueError("Empty requester.")
-
-            xpath = f'//span[contains(@class, "value")]/b[contains(text(), "{dict_html["task_requester"]}")]'
-            x = [[text_box.send_keys(i), time.sleep(0.1)] for i in f"@{dict_html['task_requester']}"]
-            user = WebDriverWait(website, 6).until(EC.presence_of_element_located((By.XPATH, xpath)))
-            user_id = user.find_element(By.XPATH, "./../../../../..").get_attribute("data-id")
-            msg = f"@[{dict_html['task_requester']}](user:{user_id})\n\n{comment}"
-        except Exception:
-            msg = comment
-
-        text_box.clear()
-        time.sleep(1)
-        text_box.send_keys(msg)
-
-        button = WebDriverWait(website, 10).until(EC.element_to_be_clickable((By.XPATH, '//button[@label="Add"]')))
-        button.click()
-        time.sleep(1)
-
-        table = pd.DataFrame([[dict_html["Partner_Name"], dict_html['task'], comment, dict_html["link_to_shop"],
-                               datetime.now()]])
+        table = pd.DataFrame([[self.data["Partner_Name"], self.data['part_title'], value,
+                               self.data["link_to_shop"], datetime.now()]])
         GoogleSheet().send_data(col=1, sheet_name="Bot msgs", data=table)
 
-        website.refresh()
-        WebDriverWait(website, 10).until(EC.visibility_of_element_located((By.XPATH, '//*[@class="content bd"]')))
+        return self.__send_request__('post', f'comment/item/{item_id}/', data={"value": msg})['rich_value']
 
-        return website.find_elements(By.XPATH, '//*[@class="content bd"]')[-1].text
-
-    def add_error_comment(self, website, comment: str, dict_html: dict) -> str:
-        website.switch_to.window(website.window_handles[2])
+    def add_error_comment(self, comment: str) -> str:
         check = re.sub('[^a-zA-Z0-9]', '', comment).lower()
 
-        # Check if adding the comment is needed
-        while True:
-            try:
-                dupl_com = True
-                website.find_element(By.XPATH, '//li[@data-type="comment"]').click()
-                WebDriverWait(website, 10).until(EC.visibility_of_element_located((By.XPATH, '//div[@class="author"]')))
-                time.sleep(1)
-
-                msgs = website.find_elements(By.XPATH, '//div[@class="activity-group"]')
-                for msg in msgs:
-                    comm_date = msg.find_element(By.XPATH, './/time')
-                    comm_date = datetime.strptime(comm_date.get_attribute('datetime').split(" ")[0], "%Y-%m-%d").date()
-
-                    author = msg.find_element(By.XPATH, './/div[@class="author"]').text
-
-                    text = re.sub('[^a-zA-Z0-9]', '', msg.text).lower()
-
-                    if (
-                            "Update Admins" in author
-                            and (datetime.now().date() - comm_date).days < dict_html['comment_period']
-                            and text != ""
-                            and check in text
-                    ):
-                        dupl_com = 'Comment not added. (Duplicate).'
-                        print(dupl_com)
-                        break
-            except Exception:
-                website.refresh()
-                time.sleep(2)
-                website.execute_script("window.scrollTo(0, document.body.scrollHeight);")
-                continue
-            break
-
-        if dupl_com != "Comment not added. (Duplicate).":
-            return self.add_comment(website, comment, dict_html)
-        else:
-            return dupl_com
+        for podio_comment in self.data['comments']:
+            comm_date = datetime.strptime(podio_comment["date"].split()[0], "%Y-%m-%d").date()
+            com_text = re.sub('[^a-zA-Z0-9]', '', podio_comment['value']).lower()
+            if (datetime.now().date() - comm_date).days < self.data['comment_period'] and check in com_text:
+                return 'Comment not added. (Duplicate).'
+        return self.add_comment(comment)
 
 
 class Admin:
@@ -480,6 +425,20 @@ class Admin:
         self.vat_rate = {'SE': 25, 'DE': 19, 'DK': 25, 'BE': 21, 'PL': 23, "SHWRM": 23, 'NL': 21, 'IT': 22,
                          'ES': 21, 'FR': 20, 'FI': 24, 'NO': 25, 'UK': 20, 'CH': 7.7}
         self.addi_shipping_fields = ['zipcode', 'name', 'street', 'street2', 'city']
+
+    def login(self, website, market: str, url: str, sec_part_url: str):
+        website.find_element(By.XPATH, '//*[@id="username"]').send_keys(login['username_admin'])
+        website.find_element(By.XPATH, '//*[@id="password"]').send_keys(login['password_admin'])
+        website.find_element(By.XPATH, '/html/body/div[2]/div/div/form/fieldset/div[4]/div/input[2]').click()
+        if market.lower() == 'cn':
+            xpath = '//button[@class="btn btn-mini login-user pull-right"]'
+            WebDriverWait(website, 10).until(EC.presence_of_element_located((By.XPATH, xpath)))
+            website.find_element(By.XPATH, xpath).click()
+            time.sleep(2)
+
+        website.get(url + sec_part_url)
+
+        WebDriverWait(website, 10).until(EC.presence_of_element_located((By.NAME, 'contactperson1')))
 
     def open(self, website, market: str, id: str) -> (str, str):
         if market.lower() in {'pl', 'shwrm'}:
@@ -505,267 +464,13 @@ class Admin:
             self.login(website, market, url, sec_part_url)
         return url, sec_part_url
 
-    def login(self, website, market: str, url: str, sec_part_url: str):
-        website.find_element(By.XPATH, '//*[@id="username"]').send_keys(login['username_admin'])
-        website.find_element(By.XPATH, '//*[@id="password"]').send_keys(login['password_admin'])
-        website.find_element(By.XPATH, '/html/body/div[2]/div/div/form/fieldset/div[4]/div/input[2]').click()
-        if market.lower() == 'cn':
-            xpath = '//button[@class="btn btn-mini login-user pull-right"]'
-            WebDriverWait(website, 10).until(EC.presence_of_element_located((By.XPATH, xpath)))
-            website.find_element(By.XPATH, xpath).click()
-            time.sleep(2)
-
-        website.get(url + sec_part_url)
-
-        WebDriverWait(website, 10).until(EC.presence_of_element_located((By.NAME, 'contactperson1')))
-
-    def get_edit_view_values(self, website) -> dict:
-        tickbox_dict = {
-            i.get_attribute("class"): 'ON' if i.is_selected() else "OFF"
-            for i in website.find_elements(By.TAG_NAME, "input")
-        }
-        input_dict = {
-            name: website.find_element(By.XPATH, f'//*[@{"class" if "feature" in name else "name"}="{name}"]').
-            get_attribute("value")
-            for name in input_fields_names.values()
-        }
-        select_dict = {
-            name: Select(website.find_element(By.XPATH, f'//*[@name="{name}"]')).first_selected_option.text
-            for name in select_fields_names.values()
-        }
-
-        return tickbox_dict | input_dict | select_dict
-
-    def fill_tickbox(self, website, dict_html: dict) -> None:
-        for key in tickbox_class_names:
-            if key not in dict_html:
-                continue
-            time.sleep(0.1)
-
-            element = website.find_element(By.CLASS_NAME, tickbox_class_names[key])
-            if dict_html[key] and dict_html[key] != 0 and not element.is_selected():
-                element.click()
-            elif (not dict_html[key] or dict_html[key] == 0) and element.is_selected():
-                element.click()
-
-    def fill_select_fields(self, website, dict_html: dict) -> (str, str):
-        for key in select_fields_names:
-            if key not in dict_html:
-                continue
-            time.sleep(0.1)
-
-            element = Select(website.find_element(By.NAME, select_fields_names[key]))
-            try:
-                element.select_by_visible_text(dict_html[key])
-            except NoSuchElementException as e:
-                if "payment_method" in key:
-                    return "Issue", f"The account number was not updated on [{dict_html['market']}] market, " \
-                                    f"due to the lack of 'account number' option in the admin. Please provide " \
-                                    f"the IBAN & SWIFT number instead."
-                elif 'country' in key.lower() and dict_html[key] not in [i.text for i in element.options]:
-                    return "Issue", f"Can`t find the country [{dict_html[key]}] on the Admin`s [{dict_html['market']}]"\
-                                    f" market. The field [{key}] cause an issue." \
-                                    f" Please make sure that the country field has correct country."
-                elif 'country' in key.lower():
-                    element.select_by_value("Netherlands")
-                else:
-                    raise ValueError("There is some issue with select fields.") from e
-
-        return "Ok", "Ok"
-
-    def fill_input_fields(self, website, dict_html: dict) -> None:
-        for key in input_fields_names:
-            if key not in dict_html or not dict_html[key]:
-                continue
-            time.sleep(0.1)
-
-            method = "class" if "feature" in input_fields_names[key] else "name"
-            element = website.find_element(By.XPATH, f'//input[@{method}="{input_fields_names[key]}"]')
-
-            if not element.is_displayed():
-                print(f"This element is not displayed on the page: {input_fields_names[key]}.")
-                continue
-
-            try:
-                if key == "Date_of_signing":
-                    signup_date = [element.send_keys(i) for i in reversed(str(dict_html[key]).split(" ")[0].split("-"))]
-                elif key == "Shop_Name" and dict_html['market'] == "CN":
-                    element.clear()
-                    element.send_keys(f"{dict_html[key]} by Miinto")
-                else:
-                    element.clear()
-                    element.send_keys(dict_html[key])
-            except:
-                print(key, "->>>><<<<< this fields has the issue.")
-                raise ValueError
-
-    def fill_new_market_fields(self, website, dict_html: dict) -> None:
-        website.find_element(By.XPATH, '//input[@name="password"]').send_keys(dict_html["Password"])
-        website.find_element(By.XPATH, '//input[@name="password2"]').send_keys(dict_html["Password"])
-
-        vat_zone = Select(website.find_element(By.XPATH, '//select[@name="vat_zone"]'))
-        if dict_html['Home_Market'] == 'UK':
-            vat_zone.select_by_visible_text('foreign')
-        else:
-            search_vat_zone = vat_zones.get(dict_html['Home_Market'])
-            v_z_value = search_vat_zone[dict_html['market']] if search_vat_zone is not None else 'eu'
-            vat_zone.select_by_visible_text(v_z_value)
-
-    def update_edit_view_admin(self, website, dict_html: dict) -> (str, str):
-        try:
-            self.open(website, dict_html['market'], dict_html['id'])
-        except Exception:
-            return "Issue", "There is an issue in All-shop-IDS or related field."
-
-        if dict_html['market'] == dict_html['All_Shop_IDs'].split(",")[-1].split("-")[0]:
-            fields_before = self.get_edit_view_values(website)
-
-        self.fill_tickbox(website, dict_html)
-        action, comment = self.fill_select_fields(website, dict_html)
-        self.fill_input_fields(website, dict_html)
-
-        if "Issue" in action:
-            return action, comment
-        elif 'Create core' in dict_html['task'] or 'other markets' in dict_html['task'].lower():
-            self.fill_new_market_fields(website, dict_html)
-
-        response = self.save_edit_view(website, dict_html)
-        if "error" in response:
-            return "Issue", response
-        elif "other market" in dict_html['task'].lower() or "Create core" in dict_html['task']:
-            fields_before = {}
-        elif dict_html['market'] != dict_html['All_Shop_IDs'].split(",")[-1].split("-")[0]:
-            return "Success", "Simple comment. (waiting for last market to generate appropriate comment)."
-
-        fields_after = self.get_edit_view_values(website)
-        all_f = {**tickbox_class_names, **input_fields_names, **select_fields_names}
-        updated_fields = "\n\n".join(f"{i.replace('_', ' ')}:\n---\n\n >[{fields_before.get(all_f[i])}]-->"
-                                     f"[{fields_after[all_f[i]]}]" for i in all_f if i in dict_html).replace("None", "")
-
-        return "Success", f"Successfully finished task: [{dict_html['task']}].\n" \
-                          f"What was updated?\n\n---\n" + updated_fields
-
-    def save_edit_view(self, website, dict_html: dict) -> str:
-        save_button = website.find_element(By.XPATH, '//button[@class="btn btn-success"]')
-        website.execute_script("arguments[0].click();", save_button)
-
-        # Get save result
-        time_start_while = time.time()
-        success_fields, error_fields = [], []
-        while not success_fields and not error_fields and time.time() - time_start_while < 4:
-            success_fields = website.find_elements(By.XPATH, '//*[@class="alert alert-success alert--success"]')
-            error_fields = website.find_elements(By.XPATH, '//*[@class="alert alert-error alert--error"]')
-
-        if success_fields:
-            response = "\n".join([i.text for i in success_fields])
-
-        elif error_fields:
-            error_message = "\n".join([i.text for i in error_fields])
-            response = f"There was an issue with task [{dict_html['task']}].\n\n" \
-                       f"(The error refers to Admin not Podio)\n" \
-                       f"Previous fields setup in {dict_html['market']} Admin has some errors:\n\n ---\n"
-            for line in error_message.split("\n"):
-                separator = "".join(i for i in [" cannot be", " must be", " does not", 'Invalid'] if i in line)
-                separator = separator or ""
-                response += "Incorrect field [" + f"]\n --- \n\n > {separator}".join(line.split(separator)) + "\n\n"
-            response += "\n\n --- \nTo handle this error please fill in the related fields in Podio.\n\n --- "
-            return response
-
-        else:
-            response = f"\n\nThere was an connection error on the page. Please check if the " \
-                       f"Admin was created on [{dict_html['market']}] market."
-            if "other market" in dict_html['task'].lower() or "Create core" in dict_html['task']:
-                return response
-
-            self.update_edit_view_admin(website, dict_html)
-            return "Try Again"
-
-            # Update Podio with new market
-        if "other markets" in dict_html['task'].lower() or "Create core" in dict_html['task']:
-            new_id = dict_html['market'] + '-' + re.findall(r'\d{4}', website.current_url)[0]
-            print("The new id is:", new_id)
-            Podio().add_new_shop_id(website, new_id)
-            website.switch_to.window(website.window_handles[3])
-
-        return response
-
-    def get_shipp_address_values(self, website) -> str:
-        titles = ["Address type", "Name", "Street", "Street 2", "Postcode", "City", "Country", "Action(s)"]
-
-        rows = [[s.text for s in i.find_elements(By.XPATH, './/td')] for i in
-                website.find_elements(By.XPATH, "//tr")[1:]]
-
-        r = []
-        for n, x in enumerate(rows, 1):
-            x = f"{rows[n - 1][0]} {n}\n---\n{''.join([f'|{titles[i]}: [{x[i]}]' for i, _ in enumerate(rows[0][1:7], 1)])}"
-            r.append(x)
-
-        return "\n\n".join(r).replace("|", f"\n >").replace(" address", "")
-
-    def update_extra_shipp_address(self, website, dict_html: dict) -> (str, str):
-        url, sec_part = self.open(website, dict_html['market'], dict_html['id'])
-
-        website.get(url + f"admin/action/_login.php?login_as={dict_html['id']}")
-        WebDriverWait(website, 10).until(EC.presence_of_element_located((By.CLASS_NAME, 'row-fluid')))
-
-        website.get(url + 'admin/shop-addresses.php')
-        WebDriverWait(website, 10).until(EC.presence_of_element_located((By.NAME, 'shop_street2')))
-
-        # DELETE EXISTING ADDRESSES
-        links = [i.find_element(By.XPATH, '../.').get_attribute("href") for i in
-                 website.find_elements(By.XPATH, '//button[@class="btn btn-mini"]')
-                 if i.find_element(By.XPATH, '../.').get_attribute("href")]
-
-        for link in links:
-            website.get(link)
-            xpath = '//button[@class="btn btn-danger address-delete"]'
-            delete = WebDriverWait(website, 10).until(EC.element_to_be_clickable((By.XPATH, xpath)))
-            delete.click()
-
-            acc = WebDriverWait(website, 10).until(EC.element_to_be_clickable((By.XPATH, '//button[@class="confirm"]')))
-            time.sleep(1)
-            acc.click()
-
-            WebDriverWait(website, 10).until(EC.presence_of_element_located((By.XPATH,
-                                                                             '//div[contains(@class, "alert alert")]')))
-        # ADD NEW ADDRESSES
-        for address_num in dict_html["shipping_locations"]:
-            address_dict = dict_html["shipping_locations"][address_num]
-
-            website.get(url + 'admin/shop-addresses.php?method=getAddressCreateForm')
-
-            xpath = '//select[@name="address_type_id"]'
-            WebDriverWait(website, 10).until(EC.presence_of_element_located((By.XPATH, xpath)))
-            address_type = Select(website.find_element(By.XPATH, xpath))
-            address_type.select_by_value("1") if "sender" in address_num.lower() else address_type.select_by_value("2")
-
-            for input_name in self.addi_shipping_fields:
-                field = website.find_element(By.XPATH, f'//input[@name="{input_name}"]')
-                field.clear()
-                field.send_keys(address_dict[input_name])
-
-            country = Select(website.find_element(By.XPATH, '//select[@name="country_code"]'))
-            country.select_by_value(address_dict['countrycode'])
-            time.sleep(0.5)
-
-            website.find_element(By.XPATH, '//button[@type="submit"]').click()
-            xpath = '//div[contains(@class, "alert alert")]'
-            WebDriverWait(website, 10).until(EC.presence_of_element_located((By.XPATH, xpath)))
-
-        values = self.get_shipp_address_values(website)
-        website.get(url + 'admin/action/_login.php?todo=admin_re_login')
-        time.sleep(1)
-
-        return "Success", f"Successfully finished adding the additional shipping locations to Admin.\n" \
-                          f"What was updated?\n\n---\n" + values
-
-    def update_commission(self, website, dict_html: dict) -> (str, str):
-        # sourcery skip: identity-comprehension
+    def update_commission(self, website, data: dict) -> (str, str):
         partner_type_box = {"partners": ["Name: Shop", "Store-"], "brands": ["Name: Brand", "Brand-"]}
-        url, sec_part = self.open(website, dict_html['market'], dict_html['id'])
+        website.switch_to.window(website.window_handles[3])
+        url, sec_part = self.open(website, data['market'], data['id'])
 
-        pure_comm = dict_html['Pure_commission_to_be_charged_on_balanced_orders']
-        new_comm = round(float(pure_comm) * ((self.vat_rate[dict_html['market']] / 100) + 1), 2)
+        pure_comm = data['Pure_commission_to_be_charged_on_balanced_orders']
+        new_comm = round(float(pure_comm) * ((self.vat_rate[data['market']] / 100) + 1), 2)
 
         reducer_type_field = Select(website.find_element(By.XPATH, '//select[@name="commission_reducer_type"]'))
         prev_reucer = reducer_type_field.first_selected_option.get_attribute("value")
@@ -782,13 +487,13 @@ class Admin:
         WebDriverWait(website, 10).until(EC.presence_of_element_located((By.XPATH, '//span[@title="Edit"]')))
 
         # Find the correct column and box to drag it
-        drag = [i for i in website.find_elements(By.XPATH, f"//li[contains(@data-default-block-type, '"
-                                                           f"{partner_type_box['partners'][1]}')]")][0]
+        drag = [i for i in website.find_elements(By.XPATH, f"//li[contains(@data-default-block-type, "
+                                                           f"'{partner_type_box['partners'][1]}')]")][0]
 
         xpath = '//div[@class="commission-tools__block js-rules-list"]'
         try:
             drop = [i for i in website.find_elements(By.XPATH, xpath) if partner_type_box[
-                dict_html['partner_type']][0].lower().replace(" ", "") in i.text.lower().replace(" ", "")][0]
+                data['partner_type']][0].lower().replace(" ", "") in i.text.lower().replace(" ", "")][0]
         except Exception:
             drop = [i for i in website.find_elements(By.XPATH, xpath) if partner_type_box[
                 "partners"][0].lower().replace(" ", "") in i.text.lower().replace(" ", "")][0]
@@ -813,14 +518,14 @@ class Admin:
                     dropdown.click()
                     shop = website.find_element(By.XPATH, "//li[@aria-selected='true']")
 
-                    if shop.get_attribute('id').split("-")[-1] == dict_html['id']:
+                    if shop.get_attribute('id').split("-")[-1] == data['id']:
                         break
 
                 close_edit = website.find_element(By.XPATH, '//*[@id="ruleForm"]/div/input[2]').click()
 
             else:
-                if not all_shops or shop.get_attribute('id').split("-")[-1] != dict_html['id']:
-                    raise ValueError(f"Can`t find shop id in commission tool - market [{dict_html['market']}]")
+                if not all_shops or shop.get_attribute('id').split("-")[-1] != data['id']:
+                    raise ValueError(f"Can`t find shop id in commission tool - market [{data['market']}]")
 
         except Exception:
             print("create new commission box for the new shop.")
@@ -836,13 +541,13 @@ class Admin:
                 raise ValueError("ERRRRR")
 
             all_shops = website.find_elements(By.XPATH, f'//li[text()="{full_name}"]')
-            shop = [i for i in all_shops if i.get_attribute('id').split("-")[-1] == dict_html['id']][0]
+            shop = [i for i in all_shops if i.get_attribute('id').split("-")[-1] == data['id']][0]
             shop.click()
 
         WebDriverWait(website, 10).until(EC.presence_of_element_located((By.XPATH, '//*[@id="ruleForm"]/input[1]')))
         name = website.find_element(By.XPATH, '//*[@id="ruleForm"]/input[1]')
         name.clear()
-        name.send_keys(dict_html['Shop_Name'])
+        name.send_keys(data['Shop_Name'])
 
         commission_value = website.find_element(By.XPATH, '//*[@id="ruleForm"]/input[2]')
         old_com = commission_value.get_attribute("value")
@@ -871,34 +576,371 @@ class Admin:
 
         if max(all_d_comm) >= float(new_comm) >= min(all_d_comm):
             if max(all_d_comm) > float(default_commission.split(" ")[0]):
-                reducer_type = "min"
+                reducer_type = "Minimum"
             elif max(all_d_comm) == float(default_commission.split(" ")[0]):
-                reducer_type = "max"
+                reducer_type = "Maximum"
         elif float(new_comm) < float(default_commission.replace(' %', '')):
-            reducer_type = "min"
+            reducer_type = "Minimum"
         elif float(new_comm) > float(default_commission.replace(' %', '')):
-            reducer_type = "max"
+            reducer_type = "Maximum"
 
-        website.switch_to.window(website.window_handles[3])
+        website.execute_script("window.open()")
+        website.switch_to.window(website.window_handles[5])
+        data['reducerType'] = reducer_type
+        action, comment = PAMS().update_edit_view(website, data)
+        if "issue" in action.lower() or "issue" in comment.lower():
+            return action, comment
 
-        reducer_field = Select(website.find_element(By.XPATH, '//select[@name="commission_reducer_type"]'))
-        if reducer_field.first_selected_option.get_attribute("value") != reducer_type:
-            reducer_field.select_by_value(reducer_type)
-
-            response = self.save_edit_view(website, dict_html)
-            if "issue" in response:
-                return "Issue", response
-
-        dict_html['commission_values'].append(f" >{dict_html['market']} ({self.vat_rate[dict_html['market']]}%VAT): "
+        data['commission_values'].append(f" >{data['market']} ({self.vat_rate[data['market']]}%VAT): "
                                               f"[{old_com}%] {prev_reucer}->[{new_comm}%] {reducer_type}\n")
 
         comment = \
             f"Successfully finished updating commission in Admin.\n" \
             f"What was updated?\n\n---\n" \
-            f"\nCommission was changed to\n---\n > [{dict_html['Pure_commission_to_be_charged_on_balanced_orders']}]" \
+            f"\nCommission was changed to\n---\n > [{data['Pure_commission_to_be_charged_on_balanced_orders']}]" \
             f"\n\nCommission value incl. VAT:\n---\n" \
-            + "\n\n".join(dict_html['commission_values'])
+            + "\n\n".join(data['commission_values'])
         return "Success", comment
+
+
+class PAMS:
+    def login(self, website):
+        website.find_element(By.XPATH, '//*[@name="username"]').send_keys(login['username_pams'])
+        website.find_element(By.XPATH, '//*[@name="password"]').send_keys(login['password_pams'])
+        website.find_element(By.XPATH, '//button[@data-name="button-login-form"]').click()
+
+        WebDriverWait(website, 10).until(EC.presence_of_element_located((By.XPATH, '//*[@data-component="partners"]')))
+
+    def open(self, website, pams_id: str) -> (str, str):
+        url = 'https://proxy-partner-management-uat.miinto.net/partners'
+        sec_part_url = f"/preview/{pams_id}/info" if pams_id and pams_id != "" else "/create/info"
+
+        # Go to edit tab
+        if url not in website.current_url:
+            website.get(url)
+            xpath = '//*[@data-component="partners" or @placeholder="Your password"]'
+            WebDriverWait(website, 10).until(EC.presence_of_element_located((By.XPATH, xpath)))
+            if website.find_elements(By.XPATH, '//*[@name="password"]'):
+                self.login(website)
+
+            website.get(url + sec_part_url)
+            xpath = '//*[@data-name="preview-primary-core-platform" or @data-name="partner-core-market"]'
+            WebDriverWait(website, 10).until(EC.presence_of_element_located((By.XPATH, xpath)))
+
+        return url, sec_part_url
+
+    def open_specific_market(self, website, market: str):
+        if market == "UK":
+            market = "GB"
+        elif market == "SHRM":
+            market = "PL"
+
+        if chanel := website.find_elements(By.XPATH, f'//div/ol/li/p[text()="{market.upper()}"]'):
+            chanel[0].click()
+        elif chanel := website.find_elements(By.XPATH, f"//button[@role='tab']/span[text()='{market.upper()}']"):
+            chanel[0].click()
+        time.sleep(0.5)
+
+        if add_market := website.find_elements(By.XPATH, '//button[@data-name="button-create-market"]'):
+            add_market[0].click()
+        elif edit_market := website.find_elements(By.XPATH, '//button[@data-name="button-market-or-partner-edit"]'):
+            edit_market[0].click()
+        time.sleep(1)
+
+    def fill_first_step(self, website, data: dict) -> None:
+        select_fields_names['core_market'] = 'partner-core-market'
+        website.find_element(By.XPATH, "//input[@name='name']").send_keys(data["Shop_Name"])
+        self.fill_select_fields(website, {"core_market": markets[data['market']]})
+        del select_fields_names['core_market']
+
+        website.find_element(By.XPATH, '//button[@data-name="button-save-and-next"]').click()
+        WebDriverWait(website, 10).until(EC.presence_of_element_located((By.XPATH, '//input[@name="orderEmail"]')))
+
+    def fill_new_market_fields(self, website, data: dict) -> None:
+        if password := website.find_elements(By.XPATH, '//input[@name="password"]'):
+            if password[0].is_enabled():
+                password[0].send_keys(data["Password"])
+                website.find_element(By.XPATH, '//input[@name="passwordRepeat"]').send_keys(data["Password"])
+
+        select_fields_names["Vat_Zone"] = "vatZone"
+
+        if data['Home_Market'] == 'UK':
+            self.fill_select_fields(website, {"Vat_Zone": "Foreign"})
+        else:
+            search_vat_zone = vat_zones.get(data['Home_Market'])
+            v_z_value = search_vat_zone[data['market']] if search_vat_zone is not None else 'EU'
+            self.fill_select_fields(website, {"Vat_Zone": v_z_value})
+
+        del select_fields_names["Vat_Zone"]
+
+    def fill_tickbox_fields(self, website, data: dict, tick_box_dict: dict = tickbox_class_names) -> None:
+        for key, value in tick_box_dict.items():
+            if key not in data:
+                continue
+            time.sleep(0.1)
+
+            element = website.find_element(By.XPATH, f'//input[@data-name="{value}"]/../div/button')
+            if data[key] and data[key] != 0 and not element.is_selected():
+                element.click()
+            elif (not data[key] or data[key] == 0) and element.is_selected():
+                element.click()
+
+    def fill_select_fields(self, website, data: dict, select_dict: dict = select_fields_names) -> (str, str):
+        for key, value in select_dict.items():
+            if key not in data:
+                continue
+            time.sleep(0.1)
+
+            element = website.find_element(By.XPATH, f'//div[@data-name="{value}"]/button')
+            if not element.is_enabled():
+                continue
+
+            element.click()
+            time.sleep(0.2)
+
+            x = f'//div[@data-name="{value}"]/div/div/div/span/span[text()="{data[key]}"]'
+            if option := website.find_elements(By.XPATH, x):
+                option[0].click()
+            elif "payment_method" in key:
+                return "Issue", f"The account number was not updated on [{data['market']}] market, " \
+                                                f"due to the lack of '{data[key]}' option in the PAMS. Please provide " \
+                                                f"the IBAN & SWIFT number instead."
+            elif 'country' in key.lower():
+                return "Issue", f"Can`t find the country [{data[key]}] on the Admin`s [{data['market']}]" \
+                                                f" market. The field [{key}] cause an issue." \
+                                                f" Please make sure that the country field has correct country."
+            else:
+                raise ValueError(f"Can't find value [{data[key]}] of [{value}].")
+
+        return "Ok", "Ok"
+
+    def fill_input_fields(self, website, data: dict, input_dict: dict = input_fields_names) -> None:
+        for key, value in input_dict.items():
+            if key not in data or not data[key]:
+                continue
+            time.sleep(0.1)
+
+            element = website.find_element(By.XPATH, f'//input[@name="{value}"]')
+            if not element.is_displayed() or not element.is_enabled():
+                continue
+
+            if "shippingAddresses.0.street1" in key:
+                element = website.find_element(By.XPATH, '//input[@name="shippingAddresses.0.name"]')
+                element.clear()
+                element.send_keys(data["Shop_Name"])
+
+            try:
+                if key == "Date_of_signing":
+                    signup_date = [element.send_keys(i) for i in reversed(str(data[key][0].date()).split("-"))]
+                elif key == "Shop_Name" and data['market'] == "CN":
+                    element.clear()
+                    element.send_keys(f"{data[key]} by Miinto")
+                else:
+                    element.clear()
+                    element.send_keys(data[key])
+            except:
+                raise ValueError(key, "->>>><<<<< this field has the issue.")
+
+    def get_edit_view_values(self, website) -> dict:
+        tickbox_dict = {
+            i.get_attribute("data-name"): 'ON' if i.find_element(By.XPATH, "../div/button").is_selected() else "OFF"
+            for i in website.find_elements(By.XPATH, "//button/../../input")
+        }
+        input_dict = {
+            name: website.find_element(By.XPATH, f'//input[@name="{name}"]').get_attribute("value")
+            for name in input_fields_names.values()
+        }
+        select_dict = {
+            name: website.find_element(By.XPATH, f'//*[@data-name="{name}"]/button/span').get_attribute("innerText")
+            for name in select_fields_names.values()
+        }
+
+        return tickbox_dict | input_dict | select_dict
+
+    def update_edit_view(self, website, data: dict) -> (str, str):
+        self.open(website, data['pams_partner_id'])
+        self.open_specific_market(website, data["market"])
+
+        if website.find_elements(By.XPATH, "//div[@data-name='partner-core-market']"):
+            self.fill_first_step(website, data)
+        if data['market'] in data['all_used_ids'].split(",")[-1]:
+            fields_before = {} if "Create core" in data['part_title'] else self.get_edit_view_values(website)
+
+        data['pams_id'] = website.current_url.split("/")[5]
+
+        self.fill_tickbox_fields(website, data)
+        self.fill_input_fields(website, data)
+        action, comment = self.fill_select_fields(website, data)
+        if "Issue" in action:
+            return action, comment
+        elif 'Create core' in data['part_title'] or 'Other markets' in data['part_title']:
+            self.fill_new_market_fields(website, data)
+
+        response = self.save_edit_view(website, data)
+        if "error" in response or "Issue" in response:
+            return "Issue", response
+        elif data['market'] not in data['all_used_ids'].split(",")[-1]:
+            return "Success", "Simple comment. (waiting for last market to generate appropriate comment)."
+
+        # GET THE VALUES FROM FIRST SAVED MARKET
+        self.open_specific_market(website, data['all_used_ids'].split(",")[0].split("-")[0])
+        fields_after = self.get_edit_view_values(website)
+        all_f = {**tickbox_class_names, **input_fields_names, **select_fields_names}
+        updated_fields = "\n\n".join(f"{i.replace('_', ' ')}:\n---\n\n >[{fields_before.get(all_f[i])}]-->"
+                                     f"[{fields_after[all_f[i]]}]" for i in all_f if i in data).replace("None", "")
+
+        return "Success", \
+            f"Successfully finished task: [{data['part_title']}].\nWhat was updated?\n\n---\n{updated_fields}"
+
+    def save_edit_view(self, website, data: dict) -> str:
+        if save := website.find_elements(By.XPATH, '//button[@data-name="button-on-save-edit-form"]'):
+            save[0].click()
+        elif data['market'] in data['all_used_ids'].split(",")[-1]:
+            save = website.find_elements(By.XPATH, '//button[@data-name="button-finish"]')
+            save[0].click()
+        elif save := website.find_elements(By.XPATH, '//button[@data-name="button-save-and-next"]'):
+            save[0].click()
+        else:
+            raise NoSuchElementException("Can't find save button in PAMS")
+
+        # Wait for save buttons to be enabled and everything to be saved
+        try:
+            WebDriverWait(website, 20).until(EC.element_to_be_clickable(save[0]))
+        except NoSuchElementException:
+            pass
+        except StaleElementReferenceException:
+            pass
+        except TimeoutException:
+            comment = f"There was an issue with task [{data['part_title']}].\n\n" \
+                      f"(The error refers to PAMS not Podio)\n" \
+                      f"Save button in PAMS is loading without any actions."
+            return f"{comment}\n\nCouldn't map all created ids in PAMS." \
+                   f"You can see it under the link:\n " \
+                   f"https://proxy-partner-management-uat.miinto.net/partners/preview/{data['pams_id']}" \
+                   if data['part_title'] in ["Other markets", "Create core"] else comment
+        time.sleep(1)
+
+        # Get save result
+        front_errors = website.find_elements(By.XPATH, "//p[contains(@data-name, 'error')]")
+        backend_errors = website.find_elements(By.XPATH, '//div[@id="marketEditErrorModal"]/div/p')
+
+        if front_errors:
+            error_message = "\n".join([i.get_attribute("data-name").replace("-", " ") for i in front_errors])
+            response = f"There was an issue with task [{data['part_title']}].\n\n" \
+                       f"(The error refers to PAMS not Podio)\n" \
+                       f"The setup in {data['market']} market has some errors:\n\n ---\n"
+            for line in error_message.split("\n"):
+                response += "Incorrect field [" + f"]\n --- \n\n > ".join(line.split("error")) + "\n\n"
+            response += "\n\n --- \nTo handle this error please fill in the related fields in Podio.\n\n --- "
+        elif backend_errors:
+            response = f"There was an issue with task [{data['part_title']}].\n\n" \
+                       f"(The error refers to PAMS not Podio)\n" \
+                       f"The setup in {data['market']} market has some errors:\n\n ---\n" \
+                       f"Backend issue \n --- \n\n > {backend_errors[0].text}" \
+                       "\n\n --- \nTo handle this error please contact with us.\n\n --- "
+        else:
+            response = "PAMS was updated"
+
+        return response
+
+    def wait_for_ids(self, website, data: dict) -> (str, str, str):
+        time.sleep(2)
+
+        website.get(f"https://proxy-partner-management-uat.miinto.net/partners/preview/{data['pams_id']}")
+        xpath = '//*[@data-name="preview-primary-core-platform"]'
+        WebDriverWait(website, 10).until(EC.visibility_of_element_located((By.XPATH, xpath)))
+        website.find_element(By.XPATH, '//button[@data-name="partner-info"]').click()
+
+        error_comment = \
+                    f"There was Issue with the integration in PAMS.\n " \
+                    f"Couldn't map all created ids in PAMS.\n\n " \
+                    f"You can see it under the link:\n " \
+                    f"https://proxy-partner-management-uat.miinto.net/partners/preview/{data['pams_id']}"
+
+        core_market = website.find_element(By.XPATH, '//p[@data-name="preview-primary-core-platform"]').text
+        core_market_short = next(key for key, value in markets.items() if value == core_market)
+        core_xpath = f'//*[@data-name="shop-id-{"GB" if core_market_short=="UK" else core_market_short}"]'
+
+        with contextlib.suppress(Exception):
+            WebDriverWait(website, 10).until(EC.visibility_of_element_located((By.XPATH, core_xpath)))
+
+        website.get(f"https://proxy-partner-management-uat.miinto.net/partners/preview/{data['pams_id']}")
+        WebDriverWait(website, 10).until(EC.visibility_of_element_located((By.XPATH, xpath)))
+
+        core_id = website.find_elements(By.XPATH, core_xpath)
+        if not core_id or not core_id[0].text.isdigit():
+            return [], "Issue", error_comment
+
+        new_ids = []
+        for shop_id in data['all_used_ids'].split(","):
+            market = shop_id.split("-")[0]
+            new_id = website.find_elements(By.XPATH, f'//*[@data-name="shop-id-{"GB" if market=="UK" else market}"]')
+            if new_id and new_id[0].text.isdigit():
+                new_ids.append(f"{market}-{new_id[0].text}")
+
+        if len(new_ids) != len(data['all_used_ids'].split(",")):
+            return new_ids, "Issue", error_comment
+
+        return new_ids, "Success", ""
+
+    def get_shipp_address_values(self, website) -> str:
+        buttons = website.find_elements(By.XPATH, '//button[contains(@data-name, "button-shipping-address-")]')[1:]
+        elements = [['SHIPPING#', 'NAME', 'STREET1', 'STREET2', 'POSTALCODE', 'CITY', 'COUNTRY']]
+        for num, button in enumerate(buttons, 1):
+            button.click()
+            elements.append([
+                website.find_element(By.XPATH, f'//*[@data-name="button-shipping-address-{num}"]').text,
+                website.find_element(By.XPATH, f'//*[@name="shippingAddresses.{num}.name"]').get_attribute('value'),
+                website.find_element(By.XPATH, f'//*[@name="shippingAddresses.{num}.street1"]').get_attribute('value'),
+                website.find_element(By.XPATH, f'//*[@name="shippingAddresses.{num}.street2"]').get_attribute('value'),
+                website.find_element(By.XPATH, f'//*[@name="shippingAddresses.{num}.zipCode"]').get_attribute('value'),
+                website.find_element(By.XPATH, f'//*[@name="shippingAddresses.{num}.city"]').get_attribute('value'),
+                website.find_element(By.XPATH, f'//*[@data-name="shippingAddresses.{num}.country"]/button/span').text
+            ])
+
+        text = ""
+        for row in elements[1:]:
+            text += f"\n\n{row[0]} \n---\n"
+            for num, cell in enumerate(row[1:], 1):
+                text += f"\n >{elements[0][num]}: [{cell}]"
+        return text
+
+    def update_extra_shipp_address(self, website, data: dict) -> (str, str):
+        self.open(website, data['pams_partner_id'])
+        self.open_specific_market(website, data["market"])
+
+        # DELETE EXISTING ADDRESSES
+        buttons = website.find_elements(By.XPATH, '//button[contains(@data-name, "button-shipping-address-")]')[1:]
+        for _ in buttons:
+            website.find_elements(By.XPATH, '//button[contains(@data-name, "button-shipping-address-")]')[-1].click()
+            website.find_element(By.XPATH, '//button[@data-name="button-remove-shipping-address"]').click()
+
+        time.sleep(5)
+
+        # ADD NEW ADDRESSES
+        for num, address_num in enumerate(data["shipping_locations"], 1):
+            website.find_element(By.XPATH, '//button[@data-name="button-add-shipping-address"]').click()
+            website.find_elements(By.XPATH, '//button[contains(@data-name, "button-shipping-address-")]')[-1].click()
+
+            address_dict = data["shipping_locations"][address_num]
+            self.fill_select_fields(website, address_dict, {'countrycode': f'shippingAddresses.{num}.country',
+                                                            'market': data['market']})
+            self.fill_input_fields(website, address_dict,
+                                   {'name': f'shippingAddresses.{num}.name',
+                                    'street': f'shippingAddresses.{num}.street1',
+                                    'street2': f'shippingAddresses.{num}.street2',
+                                    'zipcode': f'shippingAddresses.{num}.zipCode',
+                                    'city': f'shippingAddresses.{num}.city'})
+
+        response = self.save_edit_view(website, data)
+        if "error" in response:
+            return "Issue", response
+
+        self.open_specific_market(website, data["market"])
+        values = self.get_shipp_address_values(website)
+
+        return "Success", f"Successfully finished adding the additional shipping locations to Admin.\n" \
+                          f"What was updated?\n\n---\n" + values
 
 
 class ProductService:
@@ -919,17 +961,17 @@ class ProductService:
             website.find_element(By.XPATH, '//*[@type="submit"]').click()
             WebDriverWait(website, 10).until(EC.presence_of_element_located((By.XPATH, '//table')))
 
-    def create_pc_location(self, website, dict_html: dict) -> (str, str):
+    def create_pc_location(self, website, data: dict) -> (str, str):
         website.switch_to.window(website.window_handles[2])
 
-        if "PC_location_name" in dict_html:
+        if "PC_location_name" in data:
             return "Issue, but click tickbox", "The location is created already"
 
-        primary_id = dict_html["All_Shop_IDs"].split(",")[0].split("-")[1]
-        primary_market = dict_html["All_Shop_IDs"].split(",")[0].split("-")[0]
+        primary_id = data["All_Shop_IDs"].split(",")[0].split("-")[1]
+        primary_market = data["All_Shop_IDs"].split(",")[0].split("-")[0]
 
-        prefix = "S" if dict_html["partner_type"] == "partners" else "B"
-        dict_html["PC_location_name"] = f'{dict_html["Home_Market"]}-{prefix} {dict_html["Shop_Name"]} {primary_id}'
+        prefix = "S" if data["partner_type"] == "partners" else "B"
+        data["PC_location_name"] = f'{data["Home_Market"]}-{prefix} {data["Shop_Name"]} {primary_id}'
 
         pc_frame = website.find_element(By.XPATH, '//*[@id="pc-location-name"]/div[1]/div[2]/div/div')
         pc_frame.click()
@@ -937,7 +979,7 @@ class ProductService:
         website.switch_to.frame(iframe)
 
         pc_input = website.find_element(By.XPATH, '//*[@id="tinymce"]/p')
-        pc_input.send_keys(dict_html["PC_location_name"])
+        pc_input.send_keys(data["PC_location_name"])
 
         website.switch_to.default_content()
         website.find_element(By.XPATH, '//*[@id="pc-location-name"]/div[1]/div[1]/div/div[2]').click()
@@ -950,14 +992,14 @@ class ProductService:
         WebDriverWait(website, 10).until(EC.presence_of_element_located((By.XPATH, "//h1[text() = 'Create Location']")))
 
         loc_name = website.find_element(By.XPATH, '//input[@id="locationName"]')
-        loc_name.send_keys(dict_html["PC_location_name"])
+        loc_name.send_keys(data["PC_location_name"])
 
         unified_loc_id = website.find_element(By.XPATH, '//input[@id="locationUnifiedId"]')
         unified_loc_id.send_keys(f"1-m!i!s-{self.dict_location[primary_market]}-{primary_id}")
 
         website.find_element(By.XPATH, "/html/body/div[1]/div/main/form/div[2]/span").click()
         country = pycountry.countries.get(alpha_2=primary_market)
-        language = pycountry.languages.get(alpha_2=dict_html['Home_Market'])
+        language = pycountry.languages.get(alpha_2=data['Home_Market'])
 
         try:
             select_country = website.find_element(By.XPATH, f"//li[text()='{country.name}']").click()
@@ -979,11 +1021,11 @@ class ProductService:
 
         return unified_loc_id
 
-    def add_aliases(self, website, dict_html: dict) -> (str, str):
+    def add_aliases(self, website, data: dict) -> (str, str):
         website.switch_to.window(website.window_handles[3])
         self.open_pc(website)
 
-        if "PC_location_name" not in dict_html.keys():
+        if "PC_location_name" not in data.keys():
             return "Issue", "PC location name is blank or incorrect"
 
         website.get('https://proxy-product.miinto.net/locations')
@@ -991,7 +1033,7 @@ class ProductService:
                                                                            "//h1[contains(text(), 'Locations')]")))
 
         try:
-            while dict_html["PC_location_name"] not in website.find_element(By.XPATH, '//tbody').get_attribute(
+            while data["PC_location_name"] not in website.find_element(By.XPATH, '//tbody').get_attribute(
                     "textContent"):
                 next_page = website.find_element(By.XPATH, '//*[@class="feather feather-chevron-right"]').click()
                 time.sleep(0.2)
@@ -1001,7 +1043,7 @@ class ProductService:
 
         cells = website.find_elements(By.XPATH, '//tr')
         edit_link = [i.find_element(By.XPATH, './/a[@class="btn btn-outline-primary"]').get_attribute("href")
-                     for i in cells if dict_html["PC_location_name"] in i.get_attribute("textContent")][0]
+                     for i in cells if data["PC_location_name"] in i.get_attribute("textContent")][0]
 
         while True:
             try:
@@ -1016,7 +1058,7 @@ class ProductService:
                                 website.find_elements(By.XPATH, '//td') if
                                 "1-m!i!s" in i.get_attribute("textContent")]
 
-                for i, shop_id in enumerate(dict_html["All_Shop_IDs"].split(",")):
+                for i, shop_id in enumerate(data["All_Shop_IDs"].split(",")):
                     market, market_id = shop_id.split("-")[0], shop_id.split("-")[1]
                     unifed_loc = f"1-m!i!s-{self.dict_location[market]}-{market_id}"
 
@@ -1030,7 +1072,6 @@ class ProductService:
 
                         website.find_element(By.XPATH, '/html/body/div[1]/div/main/form/div[2]/button').click()
                         WebDriverWait(website, 10).until(EC.presence_of_element_located((By.ID, "nav-alias-tab")))
-
                 break
             except Exception:
                 continue
@@ -1061,7 +1102,7 @@ class GoogleSheet:
     def send_data(self, col: int, sheet_name: str, data: [list]) -> None:
         scope = ['https://spreadsheets.google.com/feeds',
                  'https://www.googleapis.com/auth/drive']
-        creds = ServiceAccountCredentials.from_json_keyfile_name('client_secret.json', scope)
+        creds = ServiceAccountCredentials.from_json_keyfile_name('Credentials/client_secret.json', scope)
         client = gspread.authorize(creds)
 
         url = "https://docs.google.com/spreadsheets/d/1Kw8t5Cdfi4zhw8JbBOE6wNyYfgxvoQDXAcQxsguLMu4/edit#gid=0"
@@ -1081,62 +1122,95 @@ class GUI:
     chromedriver_options = None
 
     @Gooey(
-        program_name="Agi Bot - Update",
-        program_description="Update Admins with Agi Bot!",
+        program_name="Podio Integration tool",
+        program_description="This tool is used to scrape Podio updates and moves them into other services",
         terminal_font_color='black',
         terminal_panel_color='white',
         progress_regex=r"^progress: (\d+)/(\d+)$",
         progress_expr="x[0] / x[1] * 100",
         disable_progress_bar_animation=False,
-        default_size=(810, 720),
-        timing_options={'show_time_remaining': True, 'hide_time_remaining_on_complete': False}
+        default_size=(910, 720),
+        timing_options={'show_time_remaining': True, 'hide_time_remaining_on_complete': False},
+        tabbed_groups=True
     )
-    def handle(self):
-        parser = GooeyParser()
-
+    def login_card(self, parser):
         user = login_default['Update Admins']
-        parser.add_argument("--username_podio", metavar='Username Podio', default=user['username_podio'])
-        parser.add_argument("--password_podio", metavar='Password Podio', widget='PasswordField',
+        log_det = parser.add_argument_group("Login details")
+
+        log_det.add_argument("--username_podio", metavar='Username Podio', default=user['username_podio'])
+        log_det.add_argument("--password_podio", metavar='Password Podio', widget='PasswordField',
                             default=user['password_podio'])
 
-        parser.add_argument("--username_admin", metavar='Username Admin', default=user['username_admin'])
-        parser.add_argument("--password_admin", metavar='Password Admin', widget='PasswordField',
+        log_det.add_argument("--username_admin", metavar='Username Admin', default=user['username_admin'])
+        log_det.add_argument("--password_admin", metavar='Password Admin', widget='PasswordField',
                             default=user['password_admin'])
 
-        parser.add_argument("--username_pc", metavar='Username Product Service', default=user['username_pc'])
-        parser.add_argument("--password_pc", metavar='Password Product Service', widget='PasswordField',
+        log_det.add_argument("--username_pc", metavar='Username Product Service', default=user['username_pc'])
+        log_det.add_argument("--password_pc", metavar='Password Product Service', widget='PasswordField',
                             default=user['password_pc'])
 
-        parser.add_argument("--threads_num", metavar="How many processes do you need at once?", widget="Slider",
-                            default=4, gooey_options={'min': 1, 'max': 6}, type=int)
-        parser.add_argument("--comment_period", metavar="After [X] days I should add the same comment?",
+        log_det.add_argument("--username_pams", metavar='Username Partner Management System',
+                            default=user['username_pams'])
+        log_det.add_argument("--password_pams", metavar='Password Partner Management System', widget='PasswordField',
+                            default=user['password_pams'])
+
+    def api_keys_card(self, parser):
+        user = login_default['Update Admins']
+        api_det = parser.add_argument_group("Podio Api Keys")
+
+        api_det.add_argument("--client_id1", metavar='Client ID Podio', default=user['client_id_podio1'])
+        api_det.add_argument("--client_secret1", metavar='Client Secret Podio', widget='PasswordField',
+                            default=user['client_secret_podio1'])
+
+        api_det.add_argument("--client_id2", metavar='Client ID Podio', default=user['client_id_podio2'])
+        api_det.add_argument("--client_secret2", metavar='Client Secret Podio', widget='PasswordField',
+                            default=user['client_secret_podio2'])
+
+        api_det.add_argument("--client_id3", metavar='Client ID Podio', default=user['client_id_podio3'])
+        api_det.add_argument("--client_secret3", metavar='Client Secret Podio', widget='PasswordField',
+                            default=user['client_secret_podio3'])
+
+        api_det.add_argument("--client_id4", metavar='Client ID Podio', default=user['client_id_podio4'])
+        api_det.add_argument("--client_secret4", metavar='Client Secret Podio', widget='PasswordField',
+                            default=user['client_secret_podio4'])
+
+        api_det.add_argument("--client_id5", metavar='Client ID Podio', default=user['client_id_podio5'])
+        api_det.add_argument("--client_secret5", metavar='Client Secret Podio', widget='PasswordField',
+                            default=user['client_secret_podio5'])
+
+    def options_card(self, parser):
+        gen_opt = parser.add_argument_group("General options")
+
+        gen_opt.add_argument("--threads_num", metavar=" How many threads do you need?", widget="Slider",
+                            gooey_options={'min': 1, 'max': 6}, type=int)
+        gen_opt.add_argument("--comment_period", metavar=" After [X] days I should add the same comment?",
                             widget="Slider", default=4, gooey_options={'min': 1, 'max': 10}, type=int)
 
-        checkboxes = parser.add_argument_group('Tasks from Podio', gooey_options={'columns': 1 - 2})
-        checkboxes.add_argument("--headless_website", metavar=" ", widget="BlockCheckbox",
+        gen_opt.add_argument("--headless_website", metavar=" ", widget="BlockCheckbox",
                                 default=True, action='store_false', gooey_options=
-                                {'checkbox_label': "headless website", 'show_label': True})
-        checkboxes.add_argument("--All_tasks", metavar=" ", widget="BlockCheckbox",
+                                {'checkbox_label': " headless website", 'show_label': True})
+        gen_opt.add_argument("--All_tasks", metavar=" ", widget="BlockCheckbox",
                                 default=True, action='store_false', gooey_options=
-                                {'checkbox_label': "All tasks except 'Add commission'", 'show_label': True})
+                                {'checkbox_label': " All tasks except 'Add commission'", 'show_label': True})
 
+    def tasks_options_card(self, parser, tasks):
         # Dynamic tick boxes to choose tasks that need to be done
-        tasks = json.load(open("Tasks.json"))
-        for index, task_key in enumerate(tasks.keys()):
-            if index == 0:
-                checkboxes = parser.add_argument_group('Detailed tasks', gooey_options={'columns': 1 - 6})
-            if index < 4:
-                checkboxes.add_argument(f"--{task_key.replace(' ', '_')}", metavar=' ',
-                                        widget="BlockCheckbox", default=False, action='store_true',
-                                        gooey_options={'checkbox_label': task_key.replace(' ', '_'),
-                                                       'show_label': True})
-            elif (index / 4).is_integer():
-                checkboxes = parser.add_argument_group('', gooey_options={'columns': 1 - 6})
-            if index >= 4:
-                checkboxes.add_argument(f"--{task_key.replace(' ', '_')}", metavar=' ',
-                                        widget="BlockCheckbox", default=False, action='store_true',
-                                        gooey_options={'checkbox_label': task_key.replace(' ', '_'),
-                                                       'show_label': True})
+        checkboxes = parser.add_argument_group("Detailed tasks")
+
+        for task_key in tasks.keys():
+            checkboxes.add_argument(f"--{task_key.replace(' ', '_')}", metavar=' ', widget="BlockCheckbox",
+                                    default=False, action='store_true', gooey_options={
+                                                                    'checkbox_label': f" {task_key.replace(' ', '_')}",
+                                                                    'show_label': True})
+
+    def handle(self):
+        tasks = json.load(open("Podio & PAMS fields/Tasks.json"))
+
+        parser = GooeyParser()
+        self.options_card(parser)
+        self.tasks_options_card(parser, tasks)
+        self.login_card(parser)
+        self.api_keys_card(parser)
 
         user_inputs = vars(parser.parse_args())
 
@@ -1165,6 +1239,7 @@ class GUI:
         self.chromedriver_options.add_argument("enable-automation")
         self.chromedriver_options.add_argument("--no-sandbox")
         self.chromedriver_options.add_argument("--dns-prefetch-disable")
+        self.chromedriver_options.page_load_strategy = "none"
 
         prefs = {"profile.default_content_settings.popups": 2, "download.default_directory": os.getcwd()}
         self.chromedriver_options.add_experimental_option("prefs", prefs)
@@ -1176,14 +1251,10 @@ class GUI:
         threads_num = user_inputs['threads_num']
         comment_period = user_inputs['comment_period']
 
-        os.environ["WDM_LOG_LEVEL"] = "0"
-        website = webdriver.Chrome(service=ChromeService(ChromeDriverManager().install()),
-                                   options=self.chromedriver_options)
-
         # Collect tasks before update
-        tasks_list = Podio().get_tasks(website, tasks_dict)
-        np.random.shuffle(tasks_list)
-        website.close()
+        access_tokens = [Podio({}, []).__get_access_token__(user_inputs[f'client_id{i}'], user_inputs[f'client_secret{i}'])
+                         for i in random.sample(range(1, 6), 5)]
+        tasks_list = Podio({}, access_tokens).get_tasks(tasks_dict)
 
         # Give different tasks between all threads
         threads = []
@@ -1192,20 +1263,14 @@ class GUI:
             start_index = l
             l += int(len(tasks_list) / threads_num)
 
-            if index == threads_num - 1:
-                print(index)
-                end_index = len(tasks_list)
-
-            else:
-                end_index = l
-
+            end_index = len(tasks_list) if index == threads_num - 1 else l
             end_index = min(end_index, len(tasks_list))
-            print(start_index, end_index, "thread_num", index)
 
             chrome_service1 = ChromeService(ChromeDriverManager().install())
             # chrome_service1.creationflags = CREATE_NO_WINDOW
             website1 = webdriver.Chrome(options=self.chromedriver_options, service=chrome_service1)
-            x = threading.Thread(target=main, args=(tasks_list[start_index:end_index], comment_period, website1))
+            x = threading.Thread(target=main, args=(website1, tasks_list[start_index:end_index], comment_period,
+                                                    tasks_dict, access_tokens))
             threads.append(x)
             x.start()
 
