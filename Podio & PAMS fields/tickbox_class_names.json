@@ -1,0 +1,7 @@
+{
+  "display_miinto_address": "featureDisplayMiintoAddress",
+  "miinto_shipping_service": "featureMiintoShippingService",
+  "free_miinto_shipping_service": "featureFreeMiintoShippingService",
+  "Transfer_price_restriction_%": "featureTransferPriceRestriction",
+  "Order_distribution_delay_(min)": "featureOrderDistributionDelay"
+}
