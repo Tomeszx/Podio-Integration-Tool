@@ -1,18 +1,7 @@
 from __future__ import annotations
 import logging
-import os
-import re
-import sys
-import threading
-import time
-
-import requests
 
 from io import BytesIO
-from lxml import etree
-from lxml.etree import _Element
-from selenium.common.exceptions import TimeoutException, NoSuchElementException
-from selenium.webdriver import ActionChains, Keys
 from selenium.webdriver.remote.webelement import WebElement
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.chrome.webdriver import WebDriver
