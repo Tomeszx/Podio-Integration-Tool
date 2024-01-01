@@ -1,0 +1,89 @@
+{
+  "Add commission": [
+    "All_Shop_IDs", "pams_partner_id", "Pure_commission_to_be_charged_on_balanced_orders"
+  ],
+  "commission": [
+    "All_Shop_IDs", "pams_partner_id", "Pure_commission_to_be_charged_on_balanced_orders"
+  ],
+  "Order email": [
+    "All_Shop_IDs", "pams_partner_id", "Order_Email"
+  ],
+  "VAT TAX": [
+    "All_Shop_IDs", "pams_partner_id", "VAT_TAX_Number"
+  ],
+  "Miinto shipping agreement": [
+    "All_Shop_IDs", "pams_partner_id", "Miinto_Shipping_Agreement"
+  ],
+  "name field change": [
+    "All_Shop_IDs", "pams_partner_id", "Legal_Name"
+  ],
+  "Price restriction": [
+    "All_Shop_IDs", "pams_partner_id"
+  ],
+  "distribution delay": [
+    "All_Shop_IDs", "pams_partner_id", "Order_distribution_delay_(min)"
+  ],
+  "PC Location": [
+    "All_Shop_IDs", "Home_Market"
+  ],
+  "Add aliases": [
+    "All_Shop_IDs", "Home_Market"
+  ],
+  "Additional shipping locations": [
+    "All_Shop_IDs", "pams_partner_id", "Additional_shipping_locations_-_Sender"
+  ],
+  "Return address": [
+    "All_Shop_IDs", "pams_partner_id", "Return_address"
+  ],
+  "Status on Admin": [
+    "All_Shop_IDs", "pams_partner_id", "Status_on_Admin"
+  ],
+  "IBAN": [
+    "All_Shop_IDs", "pams_partner_id", "Bank_Account_Number_-_IBAN_(format:_PL123456789)", "Bank_Account_Number_-_SWIFT"
+  ],
+  "Address/email": [
+    "Shipping_Address_-_Street", "Shipping_Address_-_Zip_code", "Shipping_Address_-_City", "Shipping_Address_-_Country",
+    "Invoicing_Address_-_Street", "Invoicing_Address_-_Zipcode", "Invoicing_Address_-_City",
+    "Invoicing_Address_-_Country", "Invoicing_Emails", "All_Shop_IDs", "pams_partner_id"
+  ],
+  "Invoicing Email": [
+    "Shipping_Address_-_Street", "Shipping_Address_-_Zip_code", "Shipping_Address_-_City", "Shipping_Address_-_Country",
+    "Invoicing_Address_-_Street", "Invoicing_Address_-_Zipcode", "Invoicing_Address_-_City",
+    "Invoicing_Address_-_Country", "Invoicing_Emails", "All_Shop_IDs", "pams_partner_id"
+  ],
+  "Contact person": [
+    "Contact_person_1_-_name_&_surname", "Shop_phone_number_-_shipping_labels_and_customer_service",
+    "Contact_person_-_emails", "Home_Market", "All_Shop_IDs", "pams_partner_id"
+  ],
+  "Shop phone number": [
+    "Contact_person_1_-_name_&_surname", "Shop_phone_number_-_shipping_labels_and_customer_service",
+    "Contact_person_-_emails", "Home_Market", "All_Shop_IDs", "pams_partner_id"
+  ],
+  "Create core": [
+    "Order_Email", "VAT_TAX_Number", "Miinto_Shipping_Agreement", "Bank_Account_Number_-_IBAN_(format:_PL123456789)",
+    "Bank_Account_Number_-_SWIFT", "Shipping_Address_-_Street", "Shipping_Address_-_Zip_code", "Status_on_Admin",
+    "Shipping_Address_-_City", "Shipping_Address_-_Country", "Invoicing_Address_-_Street",
+    "Invoicing_Address_-_Zipcode", "Invoicing_Address_-_City", "Invoicing_Address_-_Country", "Invoicing_Emails",
+    "Legal_Name", "Markets_to_activate_for_the_partner", "Home_Market", "Date_of_signing", "Signed_by",
+    "Contact_person_1_-_name_&_surname", "Shop_phone_number_-_shipping_labels_and_customer_service", "partner_type",
+    "Signed_by", "Contact_person_-_emails","Pure_commission_to_be_charged_on_balanced_orders"
+  ],
+  "Other markets": [
+    "Order_Email", "VAT_TAX_Number", "Miinto_Shipping_Agreement", "Bank_Account_Number_-_IBAN_(format:_PL123456789)",
+    "Bank_Account_Number_-_SWIFT", "Shipping_Address_-_Street", "Shipping_Address_-_Zip_code", "Status_on_Admin",
+    "Shipping_Address_-_City", "Shipping_Address_-_Country", "Invoicing_Address_-_Street",
+    "Invoicing_Address_-_Zipcode", "Invoicing_Address_-_City", "Invoicing_Address_-_Country", "Invoicing_Emails",
+    "Legal_Name", "Markets_to_activate_for_the_partner", "Home_Market",
+    "Contact_person_1_-_name_&_surname", "Shop_phone_number_-_shipping_labels_and_customer_service", "partner_type",
+    "Signed_by", "Contact_person_-_emails", "Date_of_signing", "Signed_by", "All_Shop_IDs", "pams_partner_id"
+  ],
+  "all fields": [
+    "Order_Email", "VAT_TAX_Number", "Miinto_Shipping_Agreement", "Bank_Account_Number_-_IBAN_(format:_PL123456789)",
+    "Bank_Account_Number_-_SWIFT", "Shipping_Address_-_Street", "Shipping_Address_-_Zip_code", "Status_on_Admin",
+    "Shipping_Address_-_City", "Shipping_Address_-_Country", "Invoicing_Address_-_Street",
+    "Invoicing_Address_-_Zipcode", "Invoicing_Address_-_City", "Invoicing_Address_-_Country", "Invoicing_Emails",
+    "Legal_Name", "Markets_to_activate_for_the_partner", "Home_Market",
+    "Contact_person_1_-_name_&_surname", "Shop_phone_number_-_shipping_labels_and_customer_service", "partner_type",
+    "Signed_by", "Contact_person_-_emails", "Date_of_signing", "Signed_by", "All_Shop_IDs", "pams_partner_id"
+  ]
+}
